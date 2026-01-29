@@ -16,7 +16,10 @@ RUN yum -y update-minimal --security --sec-severity=Important --sec-severity=Cri
 RUN groupadd makepkg # !lbbuild
 RUN useradd -m -g makepkg makepkg # !lbbuild
 
-RUN yum install -y rpm-build wget gcc flex glibc-devel make automake systemd-udev && yum clean all -y # !lbbuild
+RUN yum install -y rpm-build wget gcc flex glibc-devel make automake systemd-udev git && yum clean all -y # !lbbuild
+
+# Clone DRBD source under /var/drbd
+RUN mkdir -p /var/drbd && git clone --depth=1 https://github.com/red-hat-storage/drbd.git /var/drbd
 
 RUN cd /tmp && . "$NV" && wget "$DRBD_UTILS_DL_TGZ" # !lbbuild
 # =lbbuild COPY /${DRBD_UTILS_TGZ} /tmp/
