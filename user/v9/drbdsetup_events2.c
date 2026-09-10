@@ -32,9 +32,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include "drbdsetup.h"
-#include "drbd_nla.h"
 #include "drbdtool_common.h"
-#include <linux/genl_magic_func.h>
 #include "drbd_protocol.h"
 #include "drbd_strings.h"
 #include "drbdsetup_colors.h"
@@ -781,7 +779,8 @@ static void print_peer_device_changes(const char *prefix, const char *action_new
 	resync_suspended_changed = !old_peer_device ||
 		new_peer_device->info.peer_resync_susp_user != old_peer_device->info.peer_resync_susp_user ||
 		new_peer_device->info.peer_resync_susp_peer != old_peer_device->info.peer_resync_susp_peer ||
-		new_peer_device->info.peer_resync_susp_dependency != old_peer_device->info.peer_resync_susp_dependency;
+		new_peer_device->info.peer_resync_susp_dependency != old_peer_device->info.peer_resync_susp_dependency ||
+		new_peer_device->info.peer_resync_susp_max_parallel != old_peer_device->info.peer_resync_susp_max_parallel;
 	statistics_changed = !old_peer_device ||
 		 memcmp(&new_peer_device->statistics, &old_peer_device->statistics, sizeof(struct peer_device_statistics));
 
@@ -1093,11 +1092,12 @@ static int apply_stored_event(const char *timestamp_prefix, struct nlmsg_entry *
 	err = drbd_tla_parse(stored_info.attrs, entry->nlh);
 	if (err) {
 		fprintf(stderr, "drbd_tla_parse() failed");
-		return 1;
+		err = 1;
+	} else {
+		err = apply_event(timestamp_prefix, &stored_info);
 	}
 
-	err = apply_event(timestamp_prefix, &stored_info);
-
+	/* We were handed the entry; free it whatever happened. */
 	free(entry->nlh);
 	free(entry);
 
@@ -1109,7 +1109,7 @@ static bool seq_a_less_or_equal_b(uint32_t a, uint32_t b)
 	return (int32_t)a - (int32_t)b <= 0;
 }
 
-int print_event(const struct drbd_cmd *cm, struct genl_info *info, void *u_ptr)
+int print_event(const struct drbd_cmd *cm, struct genl_info *info, struct reply_ctx *rctx)
 {
 	static uint32_t next_seq; /* nlmsg_seq of the next message to apply */
 	static bool next_seq_known;

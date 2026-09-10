@@ -5,7 +5,7 @@
 
 #include <stdbool.h>
 #include "libgenl.h"
-#include <linux/drbd_genl_api.h>
+#include "linux/drbd_genl_userspace.h"
 #include <linux/types.h>
 
 
@@ -64,6 +64,37 @@ enum cfg_ctx_key {
 	CTX_PEER_DEVICE = CTX_PEER_NODE | CTX_VOLUME,
 };
 
+/* State of a wait-* command; owned by generic_events_cmd(). */
+struct wait_for_family_ctx {
+	struct peer_devices_list *peer_devices; /* wait list from the pre-query */
+	bool initial_state_done; /* initial state dump is complete */
+};
+
+/* Typed context passed to a drbd_cmd's handle_reply callback.
+ * The tag says which union member is valid; every consumer
+ * asserts that it received the member it expects. */
+enum reply_ctx_type {
+	RCTX_NONE,
+	RCTX_RESOURCES_TAIL,
+	RCTX_DEVICES_TAIL,
+	RCTX_CONNECTIONS_TAIL,
+	RCTX_PEER_DEVICES_TAIL,
+	RCTX_PATHS_TAIL,
+	RCTX_WAIT_FOR_FAMILY,
+};
+
+struct reply_ctx {
+	enum reply_ctx_type type;
+	union {
+		struct resources_list ***resources_tail;
+		struct devices_list ***devices_tail;
+		struct connections_list ***connections_tail;
+		struct peer_devices_list ***peer_devices_tail;
+		struct paths_list ***paths_tail;
+		struct wait_for_family_ctx *wait;
+	} u;
+};
+
 struct drbd_cmd {
 	const char* cmd;
 	enum cfg_ctx_key ctx_key;
@@ -71,10 +102,9 @@ struct drbd_cmd {
 	int tla_id; /* top level attribute id */
 	int (*function)(const struct drbd_cmd *, int, char **);
 	struct drbd_argument *drbd_args;
-	int (*handle_reply)(const struct drbd_cmd*, struct genl_info *, void *u_ptr);
+	int (*handle_reply)(const struct drbd_cmd*, struct genl_info *, struct reply_ctx *);
 	struct option *options;
 	bool missing_ok;
-	bool warn_on_missing;
 	bool continuous_poll;
 	bool set_defaults;
 	bool lockless;
@@ -130,6 +160,8 @@ struct peer_devices_list {
 	struct peer_device_statistics statistics;
 	struct devices_list *device;
 	int timeout_ms; /* used only by wait_for_family() */
+	bool seen_in_dump; /* used only by wait_for_family() */
+	bool gone; /* used only by wait_for_family() */
 };
 struct paths_list {
 	struct paths_list *next;
@@ -147,9 +179,10 @@ __attribute__((format(printf, 2, 3)))
 int (*wrap_printf_fn_t)(int indent, const char *format, ...);
 
 extern char *progname;
-typedef int (*fake_generic_get_t)(const struct drbd_cmd *cm, int timeout_arg, void *u_ptr);
+typedef int (*fake_generic_get_t)(const struct drbd_cmd *cm, int timeout_arg, struct reply_ctx *rctx);
 /* Used by drbdsetup_instrumented to redirect calls to generic_get() */
 extern fake_generic_get_t fake_generic_get;
+extern bool fake_choose_timeout;
 extern char *objname;
 extern bool opt_now;
 extern bool opt_poll;

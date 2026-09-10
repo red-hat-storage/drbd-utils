@@ -141,7 +141,6 @@ bool is_set_gi_single_node(const struct cfg_ctx *ctx);
 
 static char *get_opt_val(struct options *, const char *, char *);
 
-char ss_buffer[1024];
 const char *hostname;
 int line = 1;
 int fline;
@@ -429,6 +428,7 @@ static struct adm_cmd create_md_cmd = {"create-md", adm_create_md, &create_md_ct
 static struct adm_cmd show_gi_cmd = {"show-gi", adm_setup_and_meta, &forceable_ctx, ACF1_PEER_DEVICE .disk_required = 1};
 static struct adm_cmd get_gi_cmd = {"get-gi", adm_setup_and_meta, &forceable_ctx, ACF1_PEER_DEVICE .disk_required = 1};
 static struct adm_cmd dump_md_cmd = {"dump-md", adm_drbdmeta, &forceable_ctx, ACF1_MINOR_ONLY };
+static struct adm_cmd dump_superblock_cmd = {"dump-superblock", adm_drbdmeta, &dump_superblock_ctx, ACF1_MINOR_ONLY };
 static struct adm_cmd wipe_md_cmd = {"wipe-md", adm_drbdmeta, &forceable_ctx, ACF1_MINOR_ONLY };
 static struct adm_cmd apply_al_cmd = {"apply-al", adm_drbdmeta, &forceable_ctx, ACF1_MINOR_ONLY };
 static struct adm_cmd forget_peer_cmd = {"forget-peer", adm_forget_peer, &forceable_ctx, ACF1_DISCONNECT };
@@ -528,6 +528,7 @@ struct adm_cmd *cmds[] = {
 	&show_gi_cmd,
 	&get_gi_cmd,
 	&dump_md_cmd,
+	&dump_superblock_cmd,
 	&wipe_md_cmd,
 	&apply_al_cmd,
 	&forget_peer_cmd,
@@ -592,6 +593,13 @@ struct adm_cmd *cmds[] = {
 	adm_attach,
 	&attach_cmd_ctx,
 	CFG_DISK,
+	ACF1_MINOR_ONLY
+};
+/*  */ struct adm_cmd disk_options_early_defaults_cmd = {
+	"disk-options",
+	adm_attach,
+	&attach_cmd_ctx,
+	CFG_DISK_PREP_UP,
 	ACF1_MINOR_ONLY
 };
 /*  */ struct adm_cmd net_options_defaults_cmd = {
@@ -723,7 +731,7 @@ const struct adm_cmd *deferred_cmd(const struct deferred_cmd *dcmd)
 	return dcmd ? dcmd->ctx.cmd : NULL;
 }
 
-enum on_error { KEEP_RUNNING, EXIT_ON_FAIL };
+enum on_error { KEEP_RUNNING, EXIT_ON_FAIL, SKIP_MISSING_DISK };
 static int __call_cmd_fn(const struct cfg_ctx *ctx, enum on_error on_error)
 {
 	struct d_volume *vol = ctx->vol;
@@ -734,6 +742,8 @@ static int __call_cmd_fn(const struct cfg_ctx *ctx, enum on_error on_error)
 
 	if (ctx->cmd->disk_required &&
 	    (!vol->disk || !vol->meta_disk || !vol->meta_index)) {
+		if (on_error == SKIP_MISSING_DISK)
+			return 0;
 		rv = 10;
 		log_err("The %s command requires a local disk, but the configuration gives none.\n",
 		    ctx->cmd->name);
@@ -752,7 +762,7 @@ static int __call_cmd_fn(const struct cfg_ctx *ctx, enum on_error on_error)
 			tmp_ctx.path = path;
 			rv = tmp_ctx.cmd->function(&tmp_ctx);
 			if (rv >= 20) {
-				if (on_error == EXIT_ON_FAIL)
+				if (on_error != KEEP_RUNNING)
 					exit(rv);
 			}
 
@@ -760,7 +770,7 @@ static int __call_cmd_fn(const struct cfg_ctx *ctx, enum on_error on_error)
 	} else {
 		rv = ctx->cmd->function(ctx);
 		if (rv >= 20) {
-			if (on_error == EXIT_ON_FAIL)
+			if (on_error != KEEP_RUNNING)
 				exit(rv);
 		}
 	}
@@ -1326,7 +1336,8 @@ static int adm_attach(const struct cfg_ctx *ctx)
 	const char *argv[MAX_ARGS];
 	int argc = 0;
 	bool do_attach = (ctx->cmd == &attach_cmd);
-	bool reset = (ctx->cmd == &disk_options_defaults_cmd);
+	bool reset = (ctx->cmd == &disk_options_defaults_cmd
+		   || ctx->cmd == &disk_options_early_defaults_cmd);
 
 	if (do_attach) {
 		int rv;
@@ -1619,6 +1630,8 @@ int _adm_drbdmeta(const struct cfg_ctx *ctx, int flags, char *argument)
 	argv[NA(argc)] = ctx->cmd->name;
 	if (argument)
 		argv[NA(argc)] = argument;
+	if (!strcmp(ctx->cmd->name, "dump-superblock") && !find_backend_option("--output-format"))
+		argv[NA(argc)] = "--output-format=json";
 	add_setup_options(argv, &argc, ctx->cmd->drbdsetup_ctx);
 
 	/* For create-md, if effective-size is set,
@@ -1631,7 +1644,7 @@ int _adm_drbdmeta(const struct cfg_ctx *ctx, int flags, char *argument)
 		char sep = '=';
 		char *pos = diskful_peers;
 		int len;
-		len = snprintf(pos, pos - diskful_peers + sizeof(diskful_peers), "--diskful-peers");
+		len = snprintf(pos, sizeof(diskful_peers) - (pos - diskful_peers), "--diskful-peers");
 		assert(len > 0 && pos + len < diskful_peers + sizeof(diskful_peers));
 		pos += len;
 		for_each_connection(conn, &ctx->res->connections) {
@@ -1643,7 +1656,7 @@ int _adm_drbdmeta(const struct cfg_ctx *ctx, int flags, char *argument)
 			STAILQ_FOREACH(peer_device, &conn->peer_devices, connection_link) {
 				if (peer_device->vnr == vol->vnr) {
 					if (!peer_diskless(peer_device)) {
-						len = snprintf(pos, pos - diskful_peers + sizeof(diskful_peers),
+						len = snprintf(pos, sizeof(diskful_peers) - (pos - diskful_peers),
 								"%c%s", sep, conn->peer->node_id);
 						assert(len > 0 && pos + len < diskful_peers + sizeof(diskful_peers));
 						pos += len;
@@ -2131,7 +2144,7 @@ void free_opt(struct d_option *item)
 	free(item);
 }
 
-int _proxy_connect_name_len(const struct d_resource *res, const struct connection *conn)
+int _old_proxy_connect_name_len(const struct d_resource *res, const struct connection *conn)
 {
 	struct path *path = STAILQ_FIRST(&conn->paths); /* multiple paths via proxy, later! */
 	return (conn->name ? strlen(conn->name) : strlen(res->name)) +
@@ -2140,13 +2153,43 @@ int _proxy_connect_name_len(const struct d_resource *res, const struct connectio
 		3 /* for the two dashes and the trailing 0 character */;
 }
 
-char *_proxy_connection_name(char *conn_name, const struct d_resource *res, const struct connection *conn)
+char *_old_proxy_connection_name(char *conn_name, const struct d_resource *res, const struct connection *conn)
 {
 	struct path *path = STAILQ_FIRST(&conn->paths); /* multiple paths via proxy, later! */
 	sprintf(conn_name, "%s-%s-%s",
 		conn->name ?: res->name,
 		names_to_str_c(&path->peer_proxy->on_hosts, '_'),
 		names_to_str_c(&path->my_proxy->on_hosts, '_'));
+	return conn_name;
+}
+
+int _proxy_connect_name_len(const struct d_resource *res, const struct connection *conn)
+{
+	struct path *path = STAILQ_FIRST(&conn->paths);
+	struct hname_address *h;
+	int len = (conn->name ? strlen(conn->name) : strlen(res->name)) +
+		3 /* for the two dashes and the trailing 0 character */;
+	STAILQ_FOREACH(h, &path->hname_address_pairs, link)
+		len += strlen(names_to_str_c(&h->host_info->on_hosts, '_'));
+	return len;
+}
+
+char *_proxy_connection_name(char *conn_name, const struct d_resource *res, const struct connection *conn)
+{
+	struct path *path = STAILQ_FIRST(&conn->paths);
+	struct hname_address *h;
+	char *inside_name = NULL, *outside_name = NULL;
+	STAILQ_FOREACH(h, &path->hname_address_pairs, link) {
+		if (h->used_as_me)
+			inside_name = names_to_str_c(&h->host_info->on_hosts, '_');
+		else
+			outside_name = names_to_str_c(&h->host_info->on_hosts, '_');
+	}
+	assert(inside_name != NULL);
+	assert(outside_name != NULL);
+	sprintf(conn_name, "%s-%s-%s",
+		conn->name ?: res->name,
+		outside_name, inside_name);
 	return conn_name;
 }
 
@@ -2256,16 +2299,25 @@ static int do_proxy_conn_down(const struct cfg_ctx *ctx)
 	struct d_resource *res = ctx->res;
 	struct connection *conn = ctx->conn;
 	struct path *path = STAILQ_FIRST(&conn->paths); /* multiple paths via proxy, later! */
-	char *conn_name;
+	char *conn_name, *old_conn_name;
 	const char *argv[4] = { drbd_proxy_ctl, "-c", NULL, NULL};
+	int rv;
 
 	if (!path->my_proxy || !path->peer_proxy)
 		return 0;
 
 	conn_name = proxy_connection_name(ctx->res, conn);
 	argv[2] = ssprintf("del connection %s", conn_name);
+	rv = m_system_ex(argv, SLEEPS_SHORT, res->name);
 
-	return m_system_ex(argv, SLEEPS_SHORT, res->name);
+	/* Also delete old-scheme name for transition compatibility */
+	old_conn_name = old_proxy_connection_name(ctx->res, conn);
+	if (strcmp(old_conn_name, conn_name) != 0) {
+		argv[2] = ssprintf("del connection %s", old_conn_name);
+		m_system_ex(argv, SLEEPS_SHORT, res->name);
+	}
+
+	return rv;
 }
 
 static int check_proxy(const struct cfg_ctx *ctx, int do_up)
@@ -2820,7 +2872,7 @@ static int adm_wait_ci(const struct cfg_ctx *ctx)
 		if (saved_stdin == -1)
 			perror("dup(stdin)");
 		saved_stdout = dup(fileno(stdout));
-		if (saved_stdin == -1)
+		if (saved_stdout == -1)
 			perror("dup(stdout)");
 		fd = open("/dev/console", O_RDONLY);
 		if (fd == -1) {
@@ -2828,10 +2880,14 @@ static int adm_wait_ci(const struct cfg_ctx *ctx)
 			have_tty = 0;
 		} else {
 			dup2(fd, fileno(stdin));
+			close(fd);
 			fd = open("/dev/console", O_WRONLY);
-			if (fd == -1)
+			if (fd == -1) {
 				perror("open('/dev/console, O_WRONLY)");
-			dup2(fd, fileno(stdout));
+			} else {
+				dup2(fd, fileno(stdout));
+				close(fd);
+			}
 		}
 	}
 
@@ -2980,7 +3036,11 @@ static int adm_wait_ci(const struct cfg_ctx *ctx)
 
 	if (saved_stdin != -1) {
 		dup2(saved_stdin, fileno(stdin));
+		close(saved_stdin);
+	}
+	if (saved_stdout != -1) {
 		dup2(saved_stdout, fileno(stdout));
+		close(saved_stdout);
 	}
 
 	return 0;
@@ -3067,6 +3127,7 @@ static void print_option(struct option *opt)
 	}
 }
 
+__attribute__ ((noreturn))
 void print_usage_and_exit(struct adm_cmd *cmd, const char *addinfo, int status)
 {
 	struct option *opt;
@@ -3110,6 +3171,8 @@ void verify_ips(struct d_resource *res)
 	if ((dry_run == 1 && no_tty) || do_verify_ips == 0)
 		return;
 	if (res->ignore)
+		return;
+	if (res->proxy_only)
 		return;
 	if (res->stacked && !is_drbd_top)
 		return;
@@ -3778,12 +3841,15 @@ int main(int argc, char **argv)
 			for_each_resource(res, &config) {
 				if (!is_dump && res->ignore)
 					continue;
+				if (!is_dump && res->proxy_only &&
+				    !is_adjust && !cmd->is_proxy_cmd)
+					continue;
 
 				if (!is_dump && is_drbd_top != res->stacked)
 					continue;
 				ctx.res = res;
 				ctx.vol = NULL;
-				r = call_cmd(cmd, &ctx, EXIT_ON_FAIL);	/* does exit for r >= 20! */
+				r = call_cmd(cmd, &ctx, SKIP_MISSING_DISK);	/* does exit for r >= 20! */
 				/* this super positioning of return values is soo ugly
 				 * anyone any better idea? */
 				if (r > rv)
@@ -3868,6 +3934,14 @@ int main(int argc, char **argv)
 				}
 				if (ctx.res->ignore && !is_dump) {
 					log_err("'%s' ignored, since this host (%s) is not mentioned with an 'on' keyword.\n",
+					    ctx.res->name, hostname);
+					if (rv < E_USAGE)
+					       rv = E_USAGE;
+					continue;
+				}
+				if (ctx.res->proxy_only && !is_dump &&
+				    !is_adjust && !cmd->is_proxy_cmd) {
+					log_err("'%s' ignored, since this host (%s) is a proxy node, not a DRBD node.\n",
 					    ctx.res->name, hostname);
 					if (rv < E_USAGE)
 					       rv = E_USAGE;

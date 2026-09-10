@@ -18,6 +18,7 @@
 %bcond_without 84support
 %bcond_without drbdmon
 %bcond_with prebuiltman
+%bcond_with coverage
 %bcond_with selinux
 
 Name: drbd
@@ -153,6 +154,7 @@ This packages includes the DRBD administration tools.
 %{_prefix}/lib/drbd/notify-pri-on-incon-degr.sh
 %{_prefix}/lib/drbd/notify.sh
 %{_prefix}/lib/drbd/tnf-drbd-fence.py
+%{_prefix}/lib/drbd/drbd-fence-peer.sh
 %ghost %{_prefix}/lib/drbd/tnf-drbd-fence.pyc
 %ghost %{_prefix}/lib/drbd/tnf-drbd-fence.pyo
 %dir %{_var}/lib/drbd
@@ -162,7 +164,8 @@ This packages includes the DRBD administration tools.
 %defattr(-,root,root,-)
 %{_presetdir}/50-drbd.preset
 %{_unitdir}/drbd.service
-%{_unitdir}/drbd-graceful-shutdown.service
+%{_unitdir}/drbd-graceful-disconnect.service
+%{_unitdir}/drbd-graceful-down.service
 %{_unitdir}/drbd-lvchange@.service
 %{_unitdir}/drbd-promote@.service
 %{_unitdir}/drbd-demote-or-escalate@.service
@@ -179,6 +182,8 @@ This packages includes the DRBD administration tools.
 %config(noreplace) %{_sysconfdir}/drbd.conf
 %dir %{_sysconfdir}/drbd.d
 %config(noreplace) %{_sysconfdir}/drbd.d/global_common.conf
+%dir %{_sysconfdir}/drbd.d/fence-peer
+%dir %{_sysconfdir}/drbd.d/fence-peer/peers
 %config(noreplace) %{_sysconfdir}/multipath/conf.d/drbd.conf
 %if %{with manual}
 %{_mandir}/man8/drbd-*
@@ -187,7 +192,8 @@ This packages includes the DRBD administration tools.
 %{_mandir}/man7/drbd*@.service.*
 %{_mandir}/man7/drbd*@.target.*
 %{_mandir}/man7/drbd.service.*
-%{_mandir}/man7/drbd-graceful-shutdown.service.*
+%{_mandir}/man7/drbd-graceful-disconnect.service.*
+%{_mandir}/man7/drbd-graceful-down.service.*
 %{_mandir}/man7/drbd-configured.target.*
 %{_mandir}/man5/drbd.conf-*
 %{_mandir}/man8/drbdmeta-*
@@ -196,9 +202,14 @@ This packages includes the DRBD administration tools.
 %endif
 %endif
 %doc scripts/drbd.conf.example
+%doc scripts/fence-peer
 %doc COPYING
 %doc ChangeLog
 %doc README.md
+%if %{with coverage}
+%dir @DRBD_LIB_DIR@/coverage
+@DRBD_LIB_DIR@/coverage/*.gcno
+%endif
 
 %if %{with udev}
 %package udev
@@ -372,10 +383,11 @@ autoconf
     %{?_with_prebuiltman} \
     %{?_tmpfilesdir:--with-tmpfilesdir=%{_tmpfilesdir}} \
     --with-initscripttype=systemd \
-    %{?_without_drbdmon}
+    %{?_without_drbdmon} \
+    %{?with_coverage:--enable-coverage=package}
 make %{?_smp_mflags}
 %if %{with selinux}
-make selinux
+make selinux %{?se_policydb_version:SE_POLICYDB_VERSION=%{se_policydb_version}}
 %endif
 
 %install
@@ -433,6 +445,9 @@ fi
 
 
 %changelog
+* Tue Mar 17 2026 Roland Kammerer <roland.kammerer@linbit.com> - 9.34.0-1
+-  New upstream release
+
 * Mon Nov 03 2025 Roland Kammerer <roland.kammerer@linbit.com> - 9.33.0-1
 -  New upstream release
 

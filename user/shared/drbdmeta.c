@@ -73,7 +73,9 @@ extern FILE* yyin;
 YYSTYPE yylval;
 
 int	force = 0;
+int	quiet = 0;
 int	verbose = 0;
+static int quiet_suppressed = 0; /* counts confirmations suppressed by --force --quiet */
 int	ignore_sanity_checks = 0;
 int	dry_run = 0;
 int     option_peer_max_bio_size = 0;
@@ -85,6 +87,27 @@ unsigned option_bm_block_size = 0;
 const char *option_bm_block_size_str = NULL;
 uint64_t option_effective_size = 0;
 uint64_t option_diskful_peer_mask = 0;
+uint64_t option_peer_mask = 0;
+uint64_t option_slot_mask = 0;
+const char *option_initial_current_uuid = NULL;
+bool option_consistent = false;
+bool option_uptodate = false;
+bool option_peers_outdated = false;
+bool option_rotate_uuids = false;
+
+static uint64_t generate_random_uuid(void)
+{
+	int i;
+	for (i = 0; i < 4; i++) {
+		uint64_t val;
+		get_random_bytes(&val, sizeof(val));
+		val &= ~UINT64_C(1); /* bit 0 is reserved by the DRBD module */
+		if (val != 0 && val != UUID_JUST_CREATED)
+			return val;
+	}
+	fprintf(stderr, "Failed to generate a valid random UUID\n");
+	exit(20);
+}
 
 /* for dump-superblock */
 enum {
@@ -104,16 +127,34 @@ enum initialize_bitmap_mode {
 
 	/* MAYBE: allow to select BLKDISCARD, BLKDISCARDZEROES */
 
+	IBM_SET_ALL, /* set (instead of clear) the whole bitmap area */
 	IBM_SKIP, /* do not initialize bitmap area, leave as is */
 };
 
 enum initialize_bitmap_mode option_initialize_bitmap_mode = IBM_ZEROOUT;
+bool option_initialize_bitmap_mode_seen = false;
+
+/* Long options without a short equivalent. getopt_long() returns these values,
+ * except for the flag-setting entries, which store OPT_FLAG_SET and return 0.
+ */
+enum metaopt_long_only {
+	OPT_FLAG_SET = 1000,
+	OPT_INITIAL_CURRENT_UUID,
+	OPT_CONSISTENT,
+	OPT_UPTODATE,
+	OPT_PEERS_OUTDATED,
+	OPT_ROTATE_UUIDS,
+	OPT_VAR_LIB_DRBD,
+	OPT_PEERS,
+	OPT_BITMAP_SLOTS,
+};
 
 struct option metaopt[] = {
-    { "ignore-sanity-checks",  no_argument, &ignore_sanity_checks, 1000 },
-    { "dry-run",  no_argument, &dry_run, 1000 },
-    { "tentative", no_argument, &dry_run, 1000 },
+    { "ignore-sanity-checks",  no_argument, &ignore_sanity_checks, OPT_FLAG_SET },
+    { "dry-run",  no_argument, &dry_run, OPT_FLAG_SET },
+    { "tentative", no_argument, &dry_run, OPT_FLAG_SET },
     { "force",  no_argument,    0, 'f' },
+    { "quiet",  no_argument,    0, 'q' },
     { "verbose",  no_argument,    0, 'v' },
     { "peer-max-bio-size",  required_argument, NULL, 'p' },
     { "node-id",  required_argument, NULL, 'i' },
@@ -124,6 +165,14 @@ struct option metaopt[] = {
     { "bitmap-block-size",  required_argument, NULL, 'B' },
     { "initialize-bitmap",  required_argument, NULL, 'b' },
     { "output-format",  required_argument, NULL, 'o' },
+    { "initial-current-uuid", required_argument, NULL, OPT_INITIAL_CURRENT_UUID },
+    { "consistent", no_argument, NULL, OPT_CONSISTENT },
+    { "uptodate", no_argument, NULL, OPT_UPTODATE },
+    { "peers-outdated", no_argument, NULL, OPT_PEERS_OUTDATED },
+    { "rotate-uuids", no_argument, NULL, OPT_ROTATE_UUIDS },
+    { "var-lib-drbd", required_argument, NULL, OPT_VAR_LIB_DRBD },
+    { "peers", required_argument, NULL, OPT_PEERS },
+    { "bitmap-slots", required_argument, NULL, OPT_BITMAP_SLOTS },
     { NULL,     0,              0, 0 },
 };
 
@@ -139,7 +188,17 @@ struct option metaopt[] = {
  * AND, the exit codes should follow some defined scheme.
  */
 
-bool confirmed(const char *text)
+/*
+ * confirmed_ex - ask for confirmation, optionally with a context preamble.
+ *
+ * context: informational message printed before the question; may be NULL.
+ *          Suppressed when --force --quiet is in effect (auto-confirmed anyway).
+ * question: the yes/no question itself.
+ *
+ * In force mode, auto-confirms. With --quiet, suppresses all output.
+ * In interactive mode (no --force), context and question are always shown.
+ */
+bool confirmed_ex(const char *context, const char *question)
 {
 	const char yes[] = "yes";
 	const ssize_t N = sizeof(yes);
@@ -147,7 +206,14 @@ bool confirmed(const char *text)
 	size_t n = 0;
 	bool ok;
 
-	fprintf(stderr, "\n%s\n", text);
+	if (force && quiet) {
+		quiet_suppressed++;
+		return true;
+	}
+
+	if (context)
+		fprintf(stderr, "\n%s\n", context);
+	fprintf(stderr, "\n%s\n", question);
 
 	if (force) {
 		fprintf(stderr, "*** confirmation forced via --force option ***\n");
@@ -166,6 +232,11 @@ bool confirmed(const char *text)
 	fprintf(stderr, "\n");
 
 	return ok;
+}
+
+bool confirmed(const char *text)
+{
+	return confirmed_ex(NULL, text);
 }
 
 /*
@@ -228,6 +299,11 @@ bool confirmed(const char *text)
 #define DRBD_MD_MAGIC_08   (DRBD_MAGIC+4)
 #define DRBD_MD_MAGIC_84_UNCLEAN   (DRBD_MAGIC+5)
 #define DRBD_MD_MAGIC_09   (DRBD_MAGIC+6)
+
+/* Meta data features which drbdmeta maintains correctly. Its own counterpart
+ * of the DRBD module's DRBD_MD_FEATURES.
+ */
+#define DRBD_MD_FEATURES (DRBD_MDFF_DIVERGENCE_BITMAP)
 
 /*
  * }
@@ -359,6 +435,12 @@ int is_valid_md(enum md_format f,
 	    (f == DRBD_V09 && md->magic != DRBD_MD_MAGIC_09)) {
 		if (verbose >= 1)
 			fprintf(stderr, "%s Magic number not found\n", v);
+		return 0;
+	}
+
+	if (f == DRBD_V08 && md->bm_bytes_per_bit != BM_BLOCK_SIZE_4k) {
+		fprintf(stderr, "%s unexpected bm_bytes_per_bit: %u (expected %u)\n",
+			v, md->bm_bytes_per_bit, BM_BLOCK_SIZE_4k);
 		return 0;
 	}
 
@@ -627,6 +709,7 @@ void md_disk_09_to_cpu(struct md_cpu *cpu, const struct meta_data_on_disk_9 *dis
 	cpu->device_uuid = be64_to_cpu(disk->device_uuid.be);
 	cpu->flags = be32_to_cpu(disk->flags.be);
 	cpu->members = be64_to_cpu(disk->members.be);
+	cpu->features = be64_to_cpu(disk->features.be);
 	cpu->magic = be32_to_cpu(disk->magic.be);
 	cpu->md_size_sect = be32_to_cpu(disk->md_size_sect.be);
 	cpu->al_offset = be32_to_cpu(disk->al_offset.be);
@@ -667,6 +750,10 @@ void md_cpu_to_disk_09(struct meta_data_on_disk_9 *disk, const struct md_cpu *cp
 	disk->device_uuid.be = cpu_to_be64(cpu->device_uuid);
 	disk->flags.be = cpu_to_be32(cpu->flags);
 	disk->members.be = cpu_to_be64(cpu->members);
+	/* Retain only the features drbdmeta understands in case features are
+	 * added which require support from drbdmeta for correctness.
+	 */
+	disk->features.be = cpu_to_be64(cpu->features & DRBD_MD_FEATURES);
 	disk->magic.be = cpu_to_be32(cpu->magic);
 	disk->md_size_sect.be = cpu_to_be32(cpu->md_size_sect);
 	disk->al_offset.be = cpu_to_be32(cpu->al_offset);
@@ -887,6 +974,8 @@ struct meta_cmd cmds[] = {
 		"[--al-stripes {val}] "
 		"[--al-stripe-size-kB {val}] "
 		"[--bitmap-block-size {val}] "
+		"[--peers {val}] "
+		"[--bitmap-slots {val}] "
 		"{max_peers}",
 		meta_create_md, 1, 0, 1},
 	{"forget-peer", 0, meta_forget_peer, 1, 1, 1},
@@ -1167,6 +1256,7 @@ void m_set_v9_uuid(struct md_cpu *md, int node_id, char **argv, int argc __attri
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_FENCING)) break;
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_FULL_SYNC)) break;
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_DEVICE_SEEN)) break;
+		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_DIVERGENCE_BITMAP)) break;
 	} while (0);
 }
 
@@ -1256,7 +1346,7 @@ int v06_parse(struct format *cfg, char **argv, int argc, int *ai)
 		fprintf(stderr, "'%s' is not a valid minor number.\n", argv[0]);
 		exit(20);
 	}
-	if (asprintf(&e, "%s/drbd%lu", DRBD_LIB_DIR, minor) <= 18) {
+	if (asprintf(&e, "%s/drbd%lu", DRBD_LIB_DIR, minor) == -1) {
 		fprintf(stderr, "asprintf() failed.\n");
 		exit(20);
 	};
@@ -1448,7 +1538,7 @@ void initialize_al(struct format *cfg)
 
 void check_for_existing_data(struct format *cfg);
 
-static void zeroout_bitmap_pwrite(struct format *cfg)
+static void init_bitmap_pwrite(struct format *cfg, const char clear_or_set)
 {
 	const size_t bitmap_bytes = ALIGN(cfg->bm_bytes, cfg->md_hard_sect_size);
 
@@ -1464,7 +1554,8 @@ static void zeroout_bitmap_pwrite(struct format *cfg)
 	unsigned int percent_last_report = 0;
 	size_t chunk;
 
-	memset(on_disk_buffer, 0x00, buffer_size);
+	/* clear_or_set is 0 or 0xff */
+	memset(on_disk_buffer, clear_or_set, buffer_size);
 	for (;;) {
 		chunk = buffer_size < bytes_left ? buffer_size : bytes_left;
 		pwrite_or_die(cfg, on_disk_buffer,
@@ -1484,31 +1575,197 @@ static void zeroout_bitmap_pwrite(struct format *cfg)
 		fprintf(stderr,"\r100%%\n");
 }
 
-static void initialize_bitmap(struct format *cfg)
+static void zeroout_bitmap_pwrite(struct format *cfg)
+{
+	init_bitmap_pwrite(cfg, 0x00);
+}
+
+static void set_all_bitmap_pwrite(struct format *cfg)
+{
+	init_bitmap_pwrite(cfg, 0xff);
+}
+
+/* Which bitmap slots have anything out-of-sync?  Returns a mask of slot
+ * numbers, not of peer node ids.
+ *
+ * Unlike the other bitmap helpers this one works on the meta data as found in
+ * cfg->md, not on cfg->bm_offset and cfg->bm_bytes: it is used while converting
+ * from one meta data flavour to an other, where the byte offsets of the format
+ * we are converting *from* were never mapped. */
+static uint64_t bitmap_dirty_slots(struct format *cfg)
+{
+	off_t bm_on_disk_off = cfg->md_offset + (int64_t)cfg->md.bm_offset * 512LL;
+	/* The bitmap is the last thing in the meta data area, except with the
+	 * flexible-size internal layout, where the activity log follows it. */
+	int64_t on_disk_sect = cfg->md.al_offset < 0
+		? (int64_t)cfg->md.al_offset - cfg->md.bm_offset
+		: (int64_t)cfg->md.md_size_sect - cfg->md.bm_offset;
+	/* the bits for the last agreed size, but never more than the bitmap
+	 * area holds */
+	uint64_t on_disk_bytes = (uint64_t)on_disk_sect * 512;
+	uint64_t bytes_left = ALIGN(bm_bytes(&cfg->md, cfg->md.effective_size),
+				    cfg->md_hard_sect_size);
+	unsigned int slots = cfg->md.max_peers;
+	uint64_t all_slots = (1ULL << slots) - 1;
+	uint64_t dirty = 0;
+	uint64_t word = 0;
+	size_t chunk, i;
+
+	if (bytes_left > on_disk_bytes)
+		bytes_left = on_disk_bytes;
+
+	while (bytes_left && dirty != all_slots) {
+		chunk = buffer_size < bytes_left ? buffer_size : bytes_left;
+		pread_or_die(cfg, on_disk_buffer, chunk, bm_on_disk_off,
+			     "bitmap_dirty_slots");
+		/* the slots are interleaved, one 32 bit word each */
+		for (i = 0; i < chunk / sizeof(le_u32); i++, word++) {
+			if (((le_u32 *)on_disk_buffer)[i].le)
+				dirty |= 1ULL << (word % slots);
+		}
+		bm_on_disk_off += chunk;
+		bytes_left -= chunk;
+	}
+	return dirty;
+}
+
+/* Which bitmap slots survive a conversion that keeps fewer of them?  Returns a
+ * mask of slot numbers, empty if no peer has a bitmap slot at all.
+ *
+ * --peers names them by the peer that owns them, --bitmap-slots by
+ * number.  A slot without an owner can only be named by number: forget-peer
+ * clears the peer entry, while the slot keeps its bits until something
+ * re-writes the bitmap. */
+static uint64_t keep_slots_mask(struct format *cfg, unsigned int slots_left)
+{
+	unsigned int slots = cfg->md.max_peers;
+	uint64_t keep = 0;
+	unsigned int n = 0;
+	int p, slot;
+
+	for (slot = 0; slot < DRBD_PEERS_MAX; slot++) {
+		if (!(option_slot_mask & (1ULL << slot)))
+			continue;
+		if ((unsigned int)slot >= slots) {
+			fprintf(stderr,
+				"--bitmap-slots: this meta data has %u bitmap slot%s,"
+				" numbered 0 to %u\n",
+				slots, slots == 1 ? "" : "s", slots - 1);
+			exit(10);
+		}
+		keep |= 1ULL << slot;
+		n++;
+	}
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		if (!(option_peer_mask & (1ULL << p)))
+			continue;
+		if (cfg->md.peers[p].bitmap_index < 0) {
+			fprintf(stderr, "--peers: peer node id %d has no bitmap slot\n", p);
+			exit(10);
+		}
+		keep |= 1ULL << cfg->md.peers[p].bitmap_index;
+		n++;
+	}
+	if (n > slots_left) {
+		fprintf(stderr,
+			"%s: %u named, but only %u bitmap slot%s survives the conversion\n",
+			option_slot_mask ? "--bitmap-slots" : "--peers",
+			n, slots_left, slots_left == 1 ? "" : "s");
+		exit(10);
+	}
+	if (keep)
+		return keep;
+
+	/* Nothing named: keep the slots that peers own, as long as the
+	 * conversion has room for all of them.  Do not fall back to node id 0:
+	 * that may well be this node itself, which has no bitmap slot. */
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		if (cfg->md.peers[p].bitmap_index >= 0) {
+			keep |= 1ULL << cfg->md.peers[p].bitmap_index;
+			n++;
+		}
+	}
+	if (n <= slots_left)
+		return keep;
+
+	fprintf(stderr, "This meta data has %u bitmap slots in use, the conversion keeps %u:\n",
+		n, slots_left);
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		if (cfg->md.peers[p].bitmap_index >= 0)
+			fprintf(stderr, "  peer node id %d owns bitmap slot %d\n",
+				p, cfg->md.peers[p].bitmap_index);
+	}
+	fprintf(stderr,
+		"Name the peer to keep with --peers, or its slot with\n"
+		"--bitmap-slots.  \"drbdmeta dump-md\" shows what each slot tracks.\n");
+	exit(10);
+}
+
+/* Write the bitmap area of meta data that is about to be written.
+ *
+ * "converted" only picks the wording: for meta data that create-md converts,
+ * an all set bitmap means a full resync of a device that has data, while for
+ * new meta data it is just the initial state. */
+static void initialize_bitmap(struct format *cfg, enum initialize_bitmap_mode mode, bool converted)
 {
 	const size_t bitmap_kbytes = ALIGN(cfg->bm_bytes, cfg->md_hard_sect_size) >> 10;
+	const char *which = converted ? "the new bitmap" : "bitmap";
 	char ppb[10];
 
 	ppsize(ppb, bitmap_kbytes);
-	switch (option_initialize_bitmap_mode) {
+	switch (mode) {
 	case IBM_SKIP:
-		fprintf(stderr, "SKIPPED initializing bitmap area\n");
+		fprintf(stderr, "SKIPPED initializing %s area\n", which);
 		break;
 	case IBM_ZEROOUT_IOCTL_ONLY:
 	case IBM_ZEROOUT:
-		fprintf(stderr, "initializing bitmap (%s) to all zero\n", ppb);
+		fprintf(stderr, "initializing %s (%s) to all zero\n", which, ppb);
 		if (zeroout_bitmap_fast(cfg) == 0)
 			return;
-		if (IBM_ZEROOUT_IOCTL_ONLY == option_initialize_bitmap_mode) {
+		if (IBM_ZEROOUT_IOCTL_ONLY == mode) {
 			fprintf(stderr, "fast zero-out failed, fallback disabled\n");
 			exit(10);
 		}
 		/* fall through */
 	case IBM_ZEROOUT_PWRITE:
-		fprintf(stderr, "initializing bitmap (%s) to all zero using pwrite\n", ppb);
+		fprintf(stderr, "initializing %s (%s) to all zero using pwrite\n", which, ppb);
 		zeroout_bitmap_pwrite(cfg);
 		break;
+	case IBM_SET_ALL:
+		if (converted)
+			fprintf(stderr, "marking the whole device out-of-sync in %s (%s)\n",
+				which, ppb);
+		else
+			fprintf(stderr, "initializing %s (%s) to all set using pwrite\n",
+				which, ppb);
+		set_all_bitmap_pwrite(cfg);
+		break;
 	}
+}
+
+/* What md_convert_09_to_08() left for meta_create_md() to do to the bitmap
+ * area, once the new offsets are known and all questions are answered.
+ * IBM_SKIP: nothing, keep the bitmap as it is on disk. */
+static enum initialize_bitmap_mode convert_initialize_bitmap_mode = IBM_SKIP;
+
+static void initialize_bitmap_after_convert(struct format *cfg)
+{
+	enum initialize_bitmap_mode mode = convert_initialize_bitmap_mode;
+
+	/* The user says what the bitmap of the converted meta data looks like,
+	 * whether or not the conversion has an opinion of its own. */
+	if (option_initialize_bitmap_mode_seen) {
+		if (option_initialize_bitmap_mode == IBM_SKIP && mode != IBM_SKIP)
+			fprintf(stderr,
+				"skipping the bitmap initialization even though the bitmap\n"
+				"geometry changed: the bitmap area holds stale bits now\n");
+		mode = option_initialize_bitmap_mode;
+	} else if (mode == IBM_SKIP) {
+		/* keep the bitmap as it is on disk, and say nothing about it */
+		return;
+	}
+
+	initialize_bitmap(cfg, mode, true);
 }
 
 /* MAYBE DOES DISK WRITES!! */
@@ -1539,7 +1796,7 @@ int md_initialize_common(struct format *cfg, int do_disk_writes)
 	 * In case the current UUID is left at UUID_JUST_CREATED, the kernel
 	 * driver will set all bits to 1 when using it in a handshake...
 	 */
-	initialize_bitmap(cfg);
+	initialize_bitmap(cfg, option_initialize_bitmap_mode, false);
 
 	return 0;
 }
@@ -1916,21 +2173,22 @@ static int replay_al_84(struct format *cfg, uint32_t *hot_extent)
 		fprintf(stderr, "%u corrupt AL transactions found\n", mx - found_valid);
 
 	if (!found_valid_updates) {
-		if (found_valid == mx)
+		int ret = 0;
+		if (found_valid == mx) {
 			/* nothing to do, all slots are valid AL_TR_INITIALIZED */
-			return 0;
-
-		/* this is only expected, in case the _first_ transaction
-		 * somehow failed. */
-		if (!al_cpu[0].is_valid && found_valid == mx - 1)
-			return 0;
-
-		/* Hmm. Some transactions are valid.
-		 * Some are not.
-		 * This is not expected. */
-		/* FIXME how do we want to handle this? */
-		fprintf(stderr, "No valid AL update transaction found.\n");
-		return -EINVAL;
+		} else if (!al_cpu[0].is_valid && found_valid == mx - 1) {
+			/* this is only expected, in case the _first_ transaction
+			 * somehow failed. */
+		} else {
+			/* Hmm. Some transactions are valid.
+			 * Some are not.
+			 * This is not expected. */
+			/* FIXME how do we want to handle this? */
+			fprintf(stderr, "No valid AL update transaction found.\n");
+			ret = -EINVAL;
+		}
+		free(al_cpu);
+		return ret;
 	}
 
 	/* FIXME what do we do
@@ -1972,6 +2230,7 @@ static int replay_al_84(struct format *cfg, uint32_t *hot_extent)
 			hot_extent[slot] = al_cpu[idx].update_extent_nr[i];
 		}
 	}
+	free(al_cpu);
 	return found_valid_updates;
 }
 
@@ -2072,7 +2331,7 @@ struct extent_bit_range {
 	size_t aligned_4k_x_max_peers_on_disk_pos;
 };
 
-static unsigned int round_down(size_t i, size_t  g)
+static size_t round_down(size_t i, size_t  g)
 {
 	return i / g * g;
 }
@@ -2158,8 +2417,7 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 			continue;
 		}
 
-		j = i;
-		while (hot_extent[j+1] != ~0U) {
+		for (j = i; j + 1 < AL_EXTENTS_MAX && hot_extent[j+1] != ~0U; j++) {
 			enr_to_bit_range(&tmp_ex, hot_extent[j+1], bits_per_extent, max_peers);
 			if (verbose >= 3)
 				fprintf(stderr, "       ?: %4d: %5d: [%zd..[%zd; [%zd..[%zd; %zd; peers %d; bits pe: %zd; bm_bytes: %zd\n",
@@ -2172,12 +2430,11 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 					max_peers, bits_per_extent, bm_bytes);
 			if (tmp_ex.on_disk_word32_pos_e >= bm_bytes) {
 				fprintf(stderr, "extent %u beyond end of bitmap! (%zd >= %zd)\n",
-					hot_extent[j], tmp_ex.on_disk_word32_pos_e, bm_bytes);
+					hot_extent[j+1], tmp_ex.on_disk_word32_pos_e, bm_bytes);
 				break;
 			}
 			if (tmp_ex.on_disk_word32_pos_e >= first_ex.aligned_4k_x_max_peers_on_disk_pos + buffer_size)
 				break;
-			++j;
 		}
 		enr_to_bit_range(&last_ex, hot_extent[j], bits_per_extent, max_peers);
 
@@ -2187,6 +2444,7 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 
 		/* read the bitmap for this range */
 		bm_on_disk_pos = first_ex.aligned_4k_x_max_peers_on_disk_pos;
+		ASSERT(chunk <= buffer_size)
 		pread_or_die(cfg, on_disk_buffer, chunk, bm_on_disk_off + bm_on_disk_pos, "apply_al read bitmap chunk");
 
 		/* change the bits */
@@ -2293,6 +2551,23 @@ int meta_apply_al(struct format *cfg, char **argv __attribute((unused)), int arg
 		return -1;
 	}
 
+	/* Crashed as primary with the activity log disabled: it holds no record
+	 * of the crash window, so replaying it cannot mark anything.
+	 */
+	/* MDF_PRIMARY_IND (need_to_apply_al()): a clean shutdown clears it,
+	 * MDF_CRASHED_PRIMARY may stay set, so this runs once per crash.
+	 */
+	if (format_version(cfg) >= DRBD_V08 && need_to_apply_al(cfg) &&
+	    (cfg->md.flags & (MDF_AL_DISABLED | MDF_CRASHED_PRIMARY)) ==
+			     (MDF_AL_DISABLED | MDF_CRASHED_PRIMARY)) {
+		fprintf(stderr, "Activity log was disabled, and this node did not stop cleanly as primary.\n"
+				"Marking the whole device out-of-sync in all bitmap slots.\n");
+		set_all_bitmap_pwrite(cfg);
+		need_to_update_md_flags = 1;
+		re_initialize_anyways = 1;
+		goto initialize_al_and_update_md_flags;
+	}
+
 	al_size = cfg->md.al_stripes * cfg->md.al_stripe_size_4k * 4096;
 
 	/* read in first chunk (which is actually the whole AL
@@ -2369,6 +2644,7 @@ int meta_apply_al(struct format *cfg, char **argv __attribute((unused)), int arg
 	 * We can skip this, if it was clean anyways (err == 0),
 	 * or if we know that this is for 0.7.
 	 */
+ initialize_al_and_update_md_flags:
 	if (re_initialize_anyways || (err > 0 && !is_v07(cfg)))
 		initialize_al(cfg);
 
@@ -2557,9 +2833,12 @@ void printf_bm(struct format *cfg)
 		fprintf_bm(stdout, cfg, 0, "");
 		break;
 	case DRBD_V09:
+		/* One count per slot: cfg->bits_set only ever holds the one of
+		 * the slot dumped last. */
 		for (i = 0; i < cfg->md.max_peers; i++) {
 			printf("bitmap[%d] ", i);
 			fprintf_bm(stdout, cfg, i, "");
+			printf("# bits-set[%d] "U64";\n", i, cfg->bits_set);
 		}
 		break;
 	case DRBD_UNKNOWN:
@@ -2786,14 +3065,17 @@ void v08_check_for_resize(struct format *cfg)
 
 	if (found) {
 		if (cfg->lk_bd.bd_uuid && md_test.device_uuid != cfg->lk_bd.bd_uuid) {
-			fprintf(stderr, "Last known and found uuid differ!?\n"
-					X64(016)" != "X64(016)"\n",
-					cfg->lk_bd.bd_uuid, cfg->md.device_uuid);
+			if (!(force && quiet))
+				fprintf(stderr, "Last known and found uuid differ!?\n"
+						X64(016)" != "X64(016)"\n",
+						cfg->lk_bd.bd_uuid, cfg->md.device_uuid);
 			if (!force) {
 				found = 0;
 				fprintf(stderr, "You may --force me to ignore that.\n");
-			} else
+			} else if (!(force && quiet))
 				fprintf(stderr, "You --force'ed me to ignore that.\n");
+			else
+				quiet_suppressed++;
 		}
 	}
 	if (found)
@@ -2913,6 +3195,7 @@ int v09_md_initialize(struct format *cfg, int do_disk_writes, int max_peers)
 	cfg->md.flags = MDF_AL_CLEAN;
 	cfg->md.node_id = -1;
 	cfg->md.magic = DRBD_MD_MAGIC_09;
+	cfg->md.features = DRBD_MD_FEATURES;
 	cfg->md.al_stripes = option_al_stripes;
 	cfg->md.al_stripe_size_4k = option_al_stripe_size_4k;
 
@@ -3068,6 +3351,7 @@ char *pretty_peer_md_flags(char *inbuf, unsigned int buf_size, unsigned int flag
 	/* MDF_PEER_FENCING     */ [2] = "fencing",
 	/* MDF_PEER_FULL_SYNC   */ [3] = "full-sync",
 	/* MDF_PEER_DEVICE_SEEN */ [4] = "seen",
+	/* MDF_PEER_DIVERGENCE_BITMAP */ [5] = "divergence",
 	/* MDF_NODE_EXISTS      */ [16] = "exists",
 	};
 
@@ -3116,7 +3400,10 @@ int meta_dump_md(struct format *cfg, char **argv __attribute((unused)), int argc
 		(cfg->md.flags & MDF_AL_CLEAN) != 0;
 
 	if (!al_is_clean) {
-		fprintf(stderr, "Found meta data is \"unclean\", please apply-al first\n");
+		if (!(force && quiet))
+			fprintf(stderr, "Found meta data is \"unclean\", please apply-al first\n");
+		else
+			quiet_suppressed++;
 		if (!force)
 			return -1;
 	}
@@ -3186,9 +3473,11 @@ int meta_dump_md(struct format *cfg, char **argv __attribute((unused)), int argc
 		printf("node-id %d;\n"
 		       "current-uuid 0x"X64(016)";\n"
 		       "flags 0x"X32(08)";\n"
-		       "members 0x"X64(016)";\n",
+		       "members 0x"X64(016)";\n"
+		       "features 0x"X64(016)";\n",
 		       cfg->md.node_id,
-		       cfg->md.current_uuid, cfg->md.flags, cfg->md.members);
+		       cfg->md.current_uuid, cfg->md.flags, cfg->md.members,
+		       cfg->md.features);
 		for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
 			struct peer_md_cpu *peer = &cfg->md.peers[i];
 			char flag_buf[80];
@@ -3236,7 +3525,8 @@ int meta_dump_md(struct format *cfg, char **argv __attribute((unused)), int argc
 		}
 		printf("# bm-bytes "U64";\n", cfg->bm_bytes);
 		printf_bm(cfg); /* pretty prints the whole bitmap */
-		printf("# bits-set "U64";\n", cfg->bits_set);
+		if (format_version(cfg) < DRBD_V09)
+			printf("# bits-set "U64";\n", cfg->bits_set);
 
 		/* This is half assed, still. Hide it. */
 		if (verbose >= 10)
@@ -3375,8 +3665,8 @@ void json_dump_buffer(
 		printf( "  \"bm_max_peers\": "U32",\n"
 			"  \"node_id\": "D32",\n"
 			"  \"members\": \"0x"X64(016)"\",\n"
+			"  \"features\": \"0x"X64(016)"\",\n"
 			"  \"reserved_u64\": [ "
-			    "\"0x"X64(016)"\", "
 			    "\"0x"X64(016)"\", "
 			    "\"0x"X64(016)"\" "
 			  "],\n"
@@ -3385,9 +3675,9 @@ void json_dump_buffer(
 			md.max_peers,
 			md.node_id,
 			md.members,
+			md.features,
 			be64_to_cpu(md_on_disk_9->reserved_u64[0].be),
 			be64_to_cpu(md_on_disk_9->reserved_u64[1].be),
-			be64_to_cpu(md_on_disk_9->reserved_u64[2].be),
 			be32_to_cpu(md_on_disk_9->reserved_u32[0].be),
 			be32_to_cpu(md_on_disk_9->reserved_u32[1].be));
 	}
@@ -3907,8 +4197,17 @@ int verify_dumpfile_or_restore(struct format *cfg, char **argv, int argc, int pa
 				EXP(TK_U64);
 				EXP(';');
 				cfg->md.members = yylval.u64;
+				token = yylex();
 			} else {
 				cfg->md.members = 0;
+			}
+			if (token == TK_FEATURES) {
+				EXP(TK_U64);
+				EXP(';');
+				cfg->md.features = yylval.u64;
+				token = yylex();
+			} else {
+				cfg->md.features = 0;
 			}
 			for (i = 0; i < DRBD_NODE_ID_MAX; i++) {
 				if (token != TK_PEER)
@@ -3964,6 +4263,12 @@ int verify_dumpfile_or_restore(struct format *cfg, char **argv, int argc, int pa
 				"value must be a power-of-two in [4k .. 1M]\n");
 			exit(10);
 		}
+		if (format_version(cfg) < DRBD_V09 && yylval.u64 != BM_BLOCK_SIZE_4k) {
+			fprintf(stderr, "Invalid value for bm-byte-per-bit: "
+				"'%s' meta data supports only %u\n",
+				cfg->ops->name, BM_BLOCK_SIZE_4k);
+			exit(10);
+		}
 		EXP(TK_DEVICE_UUID); EXP(TK_U64); EXP(';');
 		cfg->md.device_uuid = yylval.u64;
 		EXP(TK_LA_BIO_SIZE); EXP(TK_NUM); EXP(';');
@@ -3999,6 +4304,12 @@ int verify_dumpfile_or_restore(struct format *cfg, char **argv, int argc, int pa
 		printf("input file parsed ok\n");
 		return 0;
 	}
+
+	/* The dump carries no activity log, and its flags may say al-clean:
+	 * whatever is in the AL area belongs to an older generation.
+	 */
+	if (format_version(cfg) >= DRBD_V07)
+		initialize_al(cfg);
 
 	err = cfg->ops->md_cpu_to_disk(cfg);
 	err = cfg->ops->close(cfg) || err;
@@ -4125,27 +4436,36 @@ void md_convert_08_to_07(struct format *cfg)
 
 void md_convert_08_to_09(struct format *cfg)
 {
+	uint64_t bitmap_uuid = cfg->md.peers[0].bitmap_uuid;
+	uint32_t peer_flags = 0;
 	int p;
 
-	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
-		cfg->md.peers[p].bitmap_uuid = 0;
-		cfg->md.peers[p].flags = 0;
-		cfg->md.peers[p].bitmap_index = -1;
-	}
-
 	if (cfg->md.flags & MDF_CONNECTED_IND)
-		cfg->md.peers[0].flags |= MDF_PEER_CONNECTED;
+		peer_flags |= MDF_PEER_CONNECTED;
 
 	if (cfg->md.flags & MDF_FULL_SYNC)
-		cfg->md.peers[0].flags |= MDF_PEER_FULL_SYNC;
+		peer_flags |= MDF_PEER_FULL_SYNC;
 
 	if (cfg->md.flags & MDF_PEER_OUT_DATED)
-		cfg->md.peers[0].flags |= MDF_PEER_OUTDATED;
+		peer_flags |= MDF_PEER_OUTDATED;
+
+	/* v08 knows one peer, and no node ids: not the one of that peer, and
+	 * not its own.  What it says about its peer holds for every peer we may
+	 * get -- none of them has seen our data -- so give it to all of them.
+	 * Our own entry is never read as a peer.  The bitmap slot stays
+	 * unassigned: DRBD 9 hands it to the peer that connects first. */
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		cfg->md.peers[p].bitmap_uuid = bitmap_uuid;
+		cfg->md.peers[p].flags = peer_flags;
+		cfg->md.peers[p].bitmap_index = -1;
+	}
 
 	cfg->md.flags &= ~(MDF_CONNECTED_IND | MDF_FULL_SYNC | MDF_PEER_OUT_DATED);
 
 	cfg->md.node_id = -1;
 	cfg->md.magic = DRBD_MD_MAGIC_09;
+	/* The peer entries above are ours, so the flags in them are current. */
+	cfg->md.features = DRBD_MD_FEATURES;
 	re_initialize_md_offsets(cfg);
 
 	if (!is_valid_md(DRBD_V09, &cfg->md, cfg->md_index, cfg->bd_size)) {
@@ -4156,6 +4476,43 @@ void md_convert_08_to_09(struct format *cfg)
 
 void md_convert_09_to_08(struct format *cfg)
 {
+	/* DRBD 8.4 and older know one bitmap slot of 4k per bit. With any other
+	 * geometry the bits of this bitmap describe other blocks than the bits
+	 * of the v08 bitmap do, and for more than one peer slot the bitmap area
+	 * also moves. */
+	unsigned int max_peers = cfg->md.max_peers;
+	bool convert_bitmap = cfg->md.bm_bytes_per_bit != BM_BLOCK_SIZE_4k ||
+			      max_peers != 1;
+	uint64_t keep_slots = keep_slots_mask(cfg, 1);	/* v08 keeps one slot */
+	uint64_t dirty = convert_bitmap && !option_initialize_bitmap_mode_seen ?
+			 bitmap_dirty_slots(cfg) : 0;
+	int slot_owner[DRBD_PEERS_MAX];	/* peer node id per slot, before we move any */
+	bool out_of_sync;
+	int keep = -1;
+	int p, slot;
+
+	for (slot = 0; slot < DRBD_PEERS_MAX; slot++)
+		slot_owner[slot] = -1;
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		slot = cfg->md.peers[p].bitmap_index;
+
+		if (slot < 0 || slot_owner[slot] >= 0)
+			continue;
+		slot_owner[slot] = p;
+		if ((keep_slots & (1ULL << slot)) && keep < 0)
+			keep = p;
+	}
+
+	/* Only the slots that are kept decide.  Unless none is: then there is
+	 * nobody to attribute out-of-sync bits to, and dropping them silently
+	 * is not an option. */
+	out_of_sync = keep_slots ? !!(dirty & keep_slots) : dirty != 0;
+
+	/* Whatever the v08 meta data still knows about a peer belongs to the
+	 * one that keeps its bitmap slot. */
+	if (keep > 0)
+		cfg->md.peers[0] = cfg->md.peers[keep];
+
 	if (cfg->md.peers[0].flags & MDF_PEER_CONNECTED)
 		cfg->md.flags |= MDF_CONNECTED_IND;
 
@@ -4167,7 +4524,93 @@ void md_convert_09_to_08(struct format *cfg)
 
 	cfg->md.magic = DRBD_MD_MAGIC_08;
 	cfg->md.max_peers = 1;
+
+	if (convert_bitmap) {
+		if (cfg->md.bm_bytes_per_bit != BM_BLOCK_SIZE_4k)
+			fprintf(stderr,
+				"Bitmap block size %u is not supported by DRBD 8.4 and older,\n",
+				cfg->md.bm_bytes_per_bit);
+		if (max_peers != 1)
+			fprintf(stderr,
+				"Bitmap slots for %u peers are not supported by DRBD 8.4 and older,\n",
+				max_peers);
+		fprintf(stderr, "re-creating the bitmap with %u bytes per bit.\n",
+			BM_BLOCK_SIZE_4k);
+
+		if (max_peers != 1) {
+			for (slot = 0; slot < (int)max_peers; slot++) {
+				if (!(keep_slots & (1ULL << slot)))
+					continue;
+				if (slot_owner[slot] >= 0)
+					fprintf(stderr, "keeping bitmap slot %d of peer node id %d\n",
+						slot, slot_owner[slot]);
+				else
+					fprintf(stderr, "keeping bitmap slot %d, which no peer owns\n",
+						slot);
+			}
+		}
+		for (slot = 0; !out_of_sync && slot < (int)max_peers; slot++) {
+			if (!(dirty & (1ULL << slot)) || (keep_slots & (1ULL << slot)))
+				continue;
+			if (slot_owner[slot] >= 0)
+				fprintf(stderr,
+					"dropping the out-of-sync bits of peer node id %d (bitmap slot %d)\n",
+					slot_owner[slot], slot);
+			else
+				fprintf(stderr,
+					"dropping the out-of-sync bits of bitmap slot %d, which no peer owns\n",
+					slot);
+		}
+
+		cfg->md.bm_bytes_per_bit = BM_BLOCK_SIZE_4k;
+
+		if (out_of_sync && !option_initialize_bitmap_mode_seen &&
+		    !confirmed("A few out-of-sync blocks become a resync of the whole device.\n"
+			       "Bring the device in sync while still running DRBD 9 instead,\n"
+			       "then convert the meta data.\n"
+			       "Mark the whole device out of sync?")) {
+			printf("Operation cancelled.\n");
+			exit(1);
+		}
+
+		/* The new bitmap area is not zero: it may reach into the former
+		 * data area, or into the middle of the old bitmap. */
+		convert_initialize_bitmap_mode = out_of_sync ? IBM_SET_ALL : IBM_ZEROOUT;
+	}
+
 	re_initialize_md_offsets(cfg);
+
+	if (cfg->md.effective_size > cfg->max_usable_sect) {
+		uint64_t usable = cfg->max_usable_sect;
+		uint64_t agreed = cfg->md.effective_size;
+		uint64_t excess = agreed - usable;
+		/* Sizes that are not a whole kB would print as equal, and a
+		 * difference of a single sector as no difference at all. */
+		bool in_sect = (usable | agreed) & 1;
+		const char *unit = in_sect ? "sectors" : "kB";
+
+		if (!in_sect) {
+			usable >>= 1;
+			agreed >>= 1;
+			excess >>= 1;
+		}
+
+		/* Only reachable via the bm_bytes_per_bit conversion above:
+		 * dropping the peers can only give space back. */
+		fprintf(stderr,
+			"The %u byte bitmap leaves only %llu %s of this device usable,\n"
+			"while the last agreed device size is %llu %s.\n"
+			"DRBD 8.4 would refuse to attach that, or truncate the device.\n"
+			"Shrink the file system and the DRBD device by %llu %s or more\n"
+			"while still running DRBD 9, then convert the meta data.\n"
+			"Conversion refused.\n",
+			cfg->md.bm_bytes_per_bit,
+			(unsigned long long)usable, unit,
+			(unsigned long long)agreed, unit,
+			(unsigned long long)excess,
+			in_sect && excess == 1 ? "sector" : unit);
+		exit(10);
+	}
 
 	if (!is_valid_md(DRBD_V08, &cfg->md, cfg->md_index, cfg->bd_size)) {
 		fprintf(stderr, "Conversion failed.\nThis is a bug :(\n");
@@ -4188,7 +4631,8 @@ void convert_md(struct format *cfg, enum md_format from)
 	case DRBD_V07:
 		switch(from) {
 		case DRBD_V09:
-			md_convert_09_to_08(cfg);
+			fprintf(stderr, "Refusing to convert v09 meta data to v07.\n");
+			exit(10);
 		case DRBD_V08:
 			md_convert_08_to_07(cfg);
 		case DRBD_V07:
@@ -4321,13 +4765,22 @@ int may_be_swap(const char *data, struct fstype_s *f)
 
 #define N_ERR_LINES 4
 #define MAX_ERR_LINE_LEN 1024
+
+static void close_fd(int *fd)
+{
+	if (*fd >= 0) {
+		close(*fd);
+		*fd = -1;
+	}
+}
+
 int guessed_size_from_pvs(struct fstype_s *f, char *dev_name)
 {
 	char buf_in[200];
 	char *buf_err[N_ERR_LINES];
-	size_t c;
+	ssize_t c;
 	unsigned long long bnum;
-	int pipes[3][2];
+	int pipes[3][2] = {{-1, -1}, {-1, -1}, {-1, -1}};
 	int err_lines = 0;
 	FILE *child_err = NULL;
 	int i;
@@ -4371,11 +4824,11 @@ int guessed_size_from_pvs(struct fstype_s *f, char *dev_name)
 		_exit(0);
 	}
 	/* parent */
-	close(pipes[0][0]); /* close unused pipe ends */
-	close(pipes[1][1]);
-	close(pipes[2][1]);
+	close_fd(&pipes[0][0]); /* close unused pipe ends */
+	close_fd(&pipes[1][1]);
+	close_fd(&pipes[2][1]);
 
-	close(pipes[0][1]); /* we do not use stdin in child */
+	close_fd(&pipes[0][1]); /* we do not use stdin in child */
 
 	/* We use blocking IO on pipes. This could deadlock,
 	 * If the child process would do something unexpected.
@@ -4388,6 +4841,8 @@ int guessed_size_from_pvs(struct fstype_s *f, char *dev_name)
 	child_err = fdopen(pipes[2][0], "r");
 	if (child_err) {
 		char *b;
+
+		pipes[2][0] = -1; /* child_err owns this fd now */
 		do {
 			err_lines = (err_lines + 1) % N_ERR_LINES;
 			b = fgets(buf_err[err_lines], MAX_ERR_LINE_LEN, child_err);
@@ -4413,11 +4868,10 @@ int guessed_size_from_pvs(struct fstype_s *f, char *dev_name)
 		fprintf(stderr, "\n");
 	}
 
-	i = 2;
 out:
-	for ( ; i >= 0; i--) {
-		close(pipes[i][0]);
-		close(pipes[i][1]);
+	for (i = 0; i < 3; i++) {
+		close_fd(&pipes[i][0]);
+		close_fd(&pipes[i][1]);
 	}
 	if (child_err)
 		fclose(child_err);
@@ -4622,23 +5076,24 @@ void check_internal_md_flavours(struct format * cfg) {
 	if (have == DRBD_UNKNOWN)
 		return;
 
-	fprintf(stderr, "You want me to create a %s%s style %s internal meta data block.\n",
-		cfg->ops->name,
-		(is_v07(cfg) && cfg->md_index == DRBD_MD_INDEX_FLEX_INT) ? "(plus)" : "",
-		cfg->md_index == DRBD_MD_INDEX_FLEX_INT ? "flexible-size" : "fixed-size");
-
-
-	fprintf(stderr, "There appears to be a %s %s internal meta data block\n"
-		"already in place on %s at byte offset %llu\n",
-		f_ops[have].name, fixed ? "fixed-size" : "flexible-size",
-		cfg->md_device_name,
-		fixed ? (long long unsigned)fixed_offset : (long long unsigned)flex_offset);
+	char *create_md_context;
+	if (asprintf(&create_md_context,
+		     "You want me to create a %s%s style %s internal meta data block.\n"
+		     "There appears to be a %s %s internal meta data block\n"
+		     "already in place on %s at byte offset %llu",
+		     cfg->ops->name,
+		     (is_v07(cfg) && cfg->md_index == DRBD_MD_INDEX_FLEX_INT) ? "(plus)" : "",
+		     cfg->md_index == DRBD_MD_INDEX_FLEX_INT ? "flexible-size" : "fixed-size",
+		     f_ops[have].name, fixed ? "fixed-size" : "flexible-size",
+		     cfg->md_device_name,
+		     fixed ? (long long unsigned)fixed_offset : (long long unsigned)flex_offset) < 0)
+		create_md_context = NULL;
 
 	if (format_version(cfg) == have) {
 		if (have != DRBD_V07
 		&& (cfg->md.al_stripes != option_al_stripes
 		||  cfg->md.al_stripe_size_4k != option_al_stripe_size_4k)) {
-			if (confirmed("Do you want to change the activity log stripe settings *only*?")) {
+			if (confirmed_ex(create_md_context, "Do you want to change the activity log stripe settings *only*?")) {
 				fprintf(stderr,
 					"Sorry, not yet fully implemented\n"
 					"Try dump-md > dump.txt; restore-md -s x -z y dump.txt\n");
@@ -4652,8 +5107,10 @@ void check_internal_md_flavours(struct format * cfg) {
 				 *  ???
 				 */
 			}
+			/* context was shown (or suppressed in quiet mode); don't repeat it */
+			create_md_context = NULL;
 		}
-		if (!confirmed("Do you really want to overwrite the existing meta-data?")) {
+		if (!confirmed_ex(create_md_context, "Do you really want to overwrite the existing meta-data?")) {
 			printf("Operation cancelled.\n");
 			exit(1); // 1 to avoid online resource counting
 		}
@@ -4663,7 +5120,7 @@ void check_internal_md_flavours(struct format * cfg) {
 
 		snprintf(msg, 160, "Valid %s meta-data found, convert to %s?",
 			 f_ops[have].name, cfg->ops->name);
-		if (confirmed(msg)) {
+		if (confirmed_ex(create_md_context, msg)) {
 			cfg->md = md_now;
 			convert_md(cfg, have);
 		} else {
@@ -4677,6 +5134,7 @@ void check_internal_md_flavours(struct format * cfg) {
 			cfg->md.magic = 0;
 		}
 	}
+	free(create_md_context);
 
 	/* we have two "internal" layouts:
 	 * v07 "fixed" internal:
@@ -4806,15 +5264,16 @@ int v08_move_internal_md_after_resize(struct format *cfg)
 	PREAD(cfg, on_disk_buffer, old_offset - cur_offset, cur_offset);
 	PWRITE(cfg, on_disk_buffer, old_offset - cur_offset, cfg->al_offset);
 
-	/* The AL was of fixed size.
-	 * Bitmap is of flexible size, new bitmap is likely larger.
-	 * We do not initialize that part, we just leave "garbage" in there.
-	 * Once DRBD "agrees" on the new lower level device size, that part of
-	 * the bitmap will be handled by the module, anyways. */
-	old_bm_offset = old_offset + cfg->md.bm_offset * 512LL;
+	/* The AL is of fixed size.
+	 * The new bitmap is larger; its extra portion covers newly-added device
+	 * sectors. Use md_old.bm_offset (the old, smaller bitmap's offset) so
+	 * that old bitmap byte 0 maps to new bitmap byte 0, preserving the
+	 * bit-to-sector correspondence. The extra trailing bytes of the new
+	 * bitmap (for new sectors) are initialised to all-dirty below. */
+	old_bm_offset = old_offset + (off_t)md_old.bm_offset * 512LL;
 
 	/* move bitmap, in chunks, peel off from the end. */
-	cur_offset = old_offset + cfg->md.al_offset * 512LL - buffer_size;
+	cur_offset = old_offset + md_old.al_offset * 512LL - buffer_size;
 	while (cur_offset > old_bm_offset) {
 		PREAD(cfg, on_disk_buffer, buffer_size, cur_offset);
 		PWRITE(cfg, on_disk_buffer, buffer_size,
@@ -4827,6 +5286,28 @@ int v08_move_internal_md_after_resize(struct format *cfg)
 	PREAD(cfg, on_disk_buffer, last_chunk_size, old_bm_offset);
 	PWRITE(cfg, on_disk_buffer, last_chunk_size, cfg->bm_offset);
 
+	/* The trailing portion of the new bitmap covers newly-added sectors.
+	 * By default we leave it as-is: the DRBD module's heuristics during
+	 * attach and resize will set those bits to the appropriate state.
+	 * The --initialize-bitmap option overrides this if the user wants
+	 * an explicit initial state (e.g. -b set-all to force a resync). */
+	if (option_initialize_bitmap_mode != IBM_SKIP) {
+		off_t old_bm_bytes = (off_t)(md_old.al_offset - md_old.bm_offset) * 512LL;
+		off_t trail_start  = cfg->bm_offset + old_bm_bytes;
+		off_t trail_end    = cfg->bm_offset + (off_t)cfg->bm_bytes;
+		off_t trail_off    = trail_start;
+		int fill = (option_initialize_bitmap_mode == IBM_SET_ALL) ? 0xff : 0x00;
+
+		memset(on_disk_buffer, fill, buffer_size);
+		while (trail_off < trail_end) {
+			off_t chunk = trail_end - trail_off;
+			if (chunk > (off_t)buffer_size)
+				chunk = buffer_size;
+			PWRITE(cfg, on_disk_buffer, chunk, trail_off);
+			trail_off += chunk;
+		}
+	}
+
 	/* fix bitmap offset in meta data,
 	 * and rewrite the "super block" */
 	re_initialize_md_offsets(cfg);
@@ -4836,11 +5317,37 @@ int v08_move_internal_md_after_resize(struct format *cfg)
 	if (!err)
 		printf("Internal drbd meta data successfully moved.\n");
 
+	if (!err) {
+		/* Ensure new metadata reaches stable storage before wiping
+		 * the old region.  Without this, a crash between the two
+		 * writes could leave the old superblock zeroed while the
+		 * new one has not yet made it to disk. */
+		fdatasync(cfg->md_fd);
+	}
+
 	if (!err && old_offset < cfg->bm_offset) {
-		/* wipe out previous meta data block, it has been superseded. */
-		cfg->wipe_resize = old_offset;
-		memset(on_disk_buffer, 0, 4096);
-		PWRITE(cfg, on_disk_buffer, 4096, old_offset);
+		/* Wipe the entire old metadata region (bitmap, AL, and
+		 * superblock) so stale data cannot be mistaken for valid
+		 * metadata by a future tool invocation.
+		 * Safety cap: stop at cfg->bm_offset in case the new and
+		 * old regions are unusually close (cannot happen for any
+		 * positive device growth, but be defensive). */
+		off_t wipe_off = old_offset + (off_t)md_old.bm_offset * 512LL;
+		off_t wipe_end = old_offset + 4096;
+
+		if (wipe_end > cfg->bm_offset)
+			wipe_end = cfg->bm_offset;
+
+		memset(on_disk_buffer, 0, buffer_size);
+		while (wipe_off < wipe_end) {
+			off_t chunk = wipe_end - wipe_off;
+			if (chunk > (off_t)buffer_size)
+				chunk = buffer_size;
+			cfg->wipe_resize = wipe_off;
+			PWRITE(cfg, on_disk_buffer, chunk, wipe_off);
+			wipe_off += chunk;
+		}
+		printf("Old meta data region zeroed.\n");
 	}
 
 	err = cfg->ops->close(cfg) || err;
@@ -4942,8 +5449,56 @@ int meta_create_md(struct format *cfg, char **argv, int argc)
 		cfg->md.effective_size = option_effective_size;
 
 	for (i = 0; i < DRBD_PEERS_MAX; i++) {
-		if (option_diskful_peer_mask & (1<<i))
+		if (option_diskful_peer_mask & (1ULL<<i))
 			cfg->md.peers[i].flags |= MDF_PEER_DEVICE_SEEN;
+	}
+
+	if (option_initial_current_uuid) {
+		if (strcmp(option_initial_current_uuid, "generate") == 0) {
+			cfg->md.current_uuid = generate_random_uuid();
+		} else {
+			char *end;
+			cfg->md.current_uuid = strtoull(option_initial_current_uuid, &end, 16);
+			if (*end != '\0') {
+				fprintf(stderr, "--initial-current-uuid: expected 'generate' or a hex value, got '%s'\n",
+					option_initial_current_uuid);
+				exit(10);
+			}
+			cfg->md.current_uuid &= ~UINT64_C(1); /* bit 0 is reserved by the DRBD module */
+			if (cfg->md.current_uuid == 0) {
+				fprintf(stderr, "--initial-current-uuid: value must not be zero\n");
+				exit(10);
+			}
+		}
+	}
+
+	if (option_consistent || option_uptodate) {
+		if (cfg->md.current_uuid == UUID_JUST_CREATED)
+			cfg->md.current_uuid = generate_random_uuid();
+	}
+
+	if (option_consistent)
+		cfg->md.flags |= MDF_CONSISTENT;
+
+	if (option_uptodate)
+		cfg->md.flags |= MDF_CONSISTENT | MDF_WAS_UP_TO_DATE;
+
+	if (option_peers_outdated) {
+		int p;
+		for (p = 0; p < DRBD_NODE_ID_MAX; p++)
+			cfg->md.peers[p].flags |= MDF_PEER_OUTDATED;
+	}
+
+	if (option_rotate_uuids) {
+		uint64_t rotate_val;
+		int p;
+		if (cfg->md.current_uuid == UUID_JUST_CREATED)
+			cfg->md.current_uuid = generate_random_uuid();
+		rotate_val = cfg->md.current_uuid;
+		for (p = 0; p < DRBD_NODE_ID_MAX; p++)
+			cfg->md.peers[p].bitmap_uuid = rotate_val;
+		cfg->md.history_uuids[0] = rotate_val;
+		cfg->md.current_uuid = generate_random_uuid();
 	}
 
 	/* FIXME
@@ -4954,6 +5509,12 @@ int meta_create_md(struct format *cfg, char **argv, int argc)
 	 * the previous DRBD into "clean" L_ESTABLISHED R_SECONDARY/R_SECONDARY, so AL
 	 * and bitmap should be empty anyways.
 	 */
+
+	/* The conversion may have changed the bitmap geometry, in which case the
+	 * bitmap has to be re-created before the new super block claims it. */
+	if (converted)
+		initialize_bitmap_after_convert(cfg);
+
 	printf("Writing meta data...\n");
 	err = err || cfg->ops->md_cpu_to_disk(cfg); // <- short circuit
 	if (!err)
@@ -5090,7 +5651,7 @@ void print_usage_and_exit()
 	size_t i;
 
 	printf
-	    ("\nUSAGE: %s [--force] DEVICE FORMAT [FORMAT ARGS...] COMMAND [CMD ARGS...]\n",
+	    ("\nUSAGE: %s [--force] [--quiet] DEVICE FORMAT [FORMAT ARGS...] COMMAND [CMD ARGS...]\n",
 	     progname);
 
 	printf("\nFORMATS:\n");
@@ -5170,7 +5731,7 @@ static enum drbd_disk_state drbd_str_disk(const char *str)
 int is_attached(int minor)
 {
 	char minor_string[7], result[40];
-	char *argv[] = { "drbdsetup", minor_string, "dstate", NULL };
+	char *argv[] = { "drbdsetup", "dstate", minor_string, NULL };
 	int pipes[2];
 	pid_t pid;
 	int rr, exitcode;
@@ -5402,6 +5963,7 @@ static enum initialize_bitmap_mode check_ibm_arg(const char *arg)
 		[IBM_ZEROOUT] = "automatic",
 		[IBM_ZEROOUT_IOCTL_ONLY] = "zeroout",
 		[IBM_ZEROOUT_PWRITE] = "pwrite",
+		[IBM_SET_ALL] = "set-all",
 		[IBM_SKIP] = "skip",
 	};
 	enum initialize_bitmap_mode i;
@@ -5444,7 +6006,7 @@ static uint64_t node_mask_from_arg(const char *arg)
 		if (base == 16)
 			result = tmp;
 		else if (0 <= tmp && tmp < DRBD_NODE_ID_MAX)
-			result |= 1<<tmp;
+			result |= 1ULL<<tmp;
 		else
 			break;
 
@@ -5460,6 +6022,21 @@ static uint64_t node_mask_from_arg(const char *arg)
 
 	fprintf(stderr, "invalid node list / mask value '%s'\n", arg);
 	exit(10);
+}
+
+static void require_v09_create_md_option(bool option_set, const char *option_name,
+					  struct format *cfg)
+{
+	if (!option_set)
+		return;
+	if (command->function != &meta_create_md) {
+		fprintf(stderr, "The --%s option is only allowed with create-md\n", option_name);
+		exit(10);
+	}
+	if (!is_v09(cfg)) {
+		fprintf(stderr, "--%s is not supported with '%s'\n", option_name, cfg->ops->name);
+		exit(10);
+	}
 }
 
 int main(int argc, char **argv)
@@ -5530,6 +6107,9 @@ int main(int argc, char **argv)
 	    case 'f':
 		force = 1;
 		break;
+	    case 'q':
+		quiet = 1;
+		break;
 	    case 'v':
 		verbose++;
 		break;
@@ -5579,11 +6159,36 @@ int main(int argc, char **argv)
 		    break;
 	    case 'b':
 		    option_initialize_bitmap_mode = check_ibm_arg(optarg);
+		    option_initialize_bitmap_mode_seen = true;
 		    break;
 	    case 'B':
 		    option_bm_block_size_str = optarg;
 		    option_bm_block_size = m_strtoll(optarg, '1') ?: DEFAULT_BM_BLOCK_SIZE;
 		    break;
+	    case OPT_INITIAL_CURRENT_UUID:
+		option_initial_current_uuid = optarg;
+		break;
+	    case OPT_CONSISTENT:
+		option_consistent = true;
+		break;
+	    case OPT_UPTODATE:
+		option_uptodate = true;
+		break;
+	    case OPT_PEERS_OUTDATED:
+		option_peers_outdated = true;
+		break;
+	    case OPT_ROTATE_UUIDS:
+		option_rotate_uuids = true;
+		break;
+	    case OPT_VAR_LIB_DRBD:
+		drbd_lib_dir_override = optarg;
+		break;
+	    case OPT_PEERS:
+		option_peer_mask = node_mask_from_arg(optarg);
+		break;
+	    case OPT_BITMAP_SLOTS:
+		option_slot_mask = node_mask_from_arg(optarg);
+		break;
 	    default:
 		print_usage_and_exit();
 		break;
@@ -5704,6 +6309,30 @@ int main(int argc, char **argv)
 		exit(10);
 	}
 
+	if (option_peer_mask &&
+	    command->function != &meta_create_md) {
+		fprintf(stderr, "The --peers option is only allowed with create-md\n");
+		exit(10);
+	}
+
+	if (option_slot_mask &&
+	    command->function != &meta_create_md) {
+		fprintf(stderr, "The --bitmap-slots option is only allowed with create-md\n");
+		exit(10);
+	}
+
+	if (option_peer_mask && option_slot_mask) {
+		fprintf(stderr, "Name either peers or bitmap slots to keep, not both\n");
+		exit(10);
+	}
+
+	/* The first one is `!!(char*)`; the other are simple bool flags */
+	require_v09_create_md_option(!!option_initial_current_uuid, "initial-current-uuid", cfg);
+	require_v09_create_md_option(option_consistent, "consistent", cfg);
+	require_v09_create_md_option(option_uptodate, "uptodate", cfg);
+	require_v09_create_md_option(option_peers_outdated, "peers-outdated", cfg);
+	require_v09_create_md_option(option_rotate_uuids, "rotate-uuids", cfg);
+
 	/* at some point I'd like to go for this: (16*1024*1024/4) */
 	if ((uint64_t)option_al_stripes * option_al_stripe_size_4k > (buffer_size/4096)) {
 		    fprintf(stderr, "invalid (too large) al-stripe* settings\n");
@@ -5737,6 +6366,9 @@ int main(int argc, char **argv)
 	rv = command->function(cfg, argv + ai, argc - ai);
 	if (minor_attached)
 		fprintf(stderr, "# Output might be stale, since minor %d is attached\n", cfg->minor);
+	if (quiet_suppressed)
+		fprintf(stderr, "# --force --quiet: %d confirmation(s) suppressed and auto-confirmed\n",
+			quiet_suppressed);
 
 	return rv;
 	/* and if we want an explicit free,

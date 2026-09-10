@@ -106,6 +106,7 @@ enum yytokentype {
 	TK_MODULE_LT,
 	TK_MODULE_LE,
 	TK_KMODVERS,
+	TK_TIEBREAKER,
 };
 
 typedef struct YYSTYPE {
@@ -129,9 +130,9 @@ void yypop_buffer_state (void );
 void yyrestart(FILE *input_file);
 void free_btrees(void);
 void check_minor_nonsense(const char *devname, const int explicit_minor);
-void pe_expected(const char *exp);
+void pe_expected(const char *exp) __attribute__ ((noreturn));
 void check_string_error(int got);
-void pe_expected_got(const char *exp, int got);
+void pe_expected_got(const char *exp, int got) __attribute__ ((noreturn));
 
 #define EXP(TOKEN1)						\
 ({								\
