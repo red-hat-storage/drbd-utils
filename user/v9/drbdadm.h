@@ -23,7 +23,7 @@
 
 #include "linux/drbd.h"
 
-/* FIXME keep in sync with GENL_MAGIC_VERSION,
+/* FIXME keep in sync with DRBD_FAMILY_VERSION,
  * without including all the genl magic...
  */
 #define API_VERSION 2
@@ -122,6 +122,8 @@ struct d_volume
 	unsigned int parsed_device :1;
 	unsigned int parsed_disk :1;
 	unsigned int parsed_meta_disk :1;
+	unsigned int parsed_tiebreaker :1; /* was "tiebreaker" explicitly set? */
+	unsigned int tiebreaker :1;        /* 1 = yes (default), 0 = no */
 };
 
 STAILQ_HEAD(volumes, d_volume);
@@ -178,7 +180,6 @@ struct path
 
 	unsigned int implicit:1;
 	unsigned int adj_seen:1;
-	unsigned int proxy_conn_is_down:1;
 	unsigned int ignore:1;
 	STAILQ_ENTRY(path) link;
 };
@@ -252,6 +253,8 @@ struct d_resource
 	unsigned int peers_addrs_set:1; /* all peer addresses set */
 	unsigned int no_bitmap_done:1;
 
+	unsigned int proxy_only:1;
+
 	/* if a prerequisite command failed, don't try any further commands.
 	 * see run_deferred_cmds() */
 	unsigned int skip_further_deferred_command:1;
@@ -275,7 +278,7 @@ enum drbd_cfg_stage {
 	/* detach/attach local disks, */
 	/* detach, del-minor */
 	CFG_DISK_PREP_DOWN,
-	/* new-minor */
+	/* new-minor, disk-options (bitmap enable) */
 	CFG_DISK_PREP_UP,
 
 	/* disconnect */
@@ -386,6 +389,7 @@ extern struct adm_cmd res_options_defaults_cmd;
 extern struct adm_cmd attach_cmd;
 extern struct adm_cmd disk_options_cmd;
 extern struct adm_cmd disk_options_defaults_cmd;
+extern struct adm_cmd disk_options_early_defaults_cmd;
 extern struct adm_cmd resize_cmd;
 extern struct adm_cmd new_peer_cmd;
 extern struct adm_cmd del_peer_cmd;
@@ -402,7 +406,6 @@ extern struct adm_cmd del_minor_cmd;
 extern struct adm_cmd proxy_conn_down_cmd;
 extern struct adm_cmd proxy_conn_up_cmd;
 extern struct adm_cmd proxy_conn_plugins_cmd;
-extern struct adm_cmd proxy_reconf_cmd;
 extern struct adm_cmd sh_list_adjustable;
 
 struct d_name *find_backend_option(const char *opt_name);
@@ -458,6 +461,10 @@ extern void set_me_in_resource(struct d_resource* res, int match_on_proxy);
 extern void set_peer_in_resource(struct d_resource* res, int peer_required);
 extern void set_on_hosts_in_res(struct d_resource *res);
 extern void set_disk_in_res(struct d_resource *res);
+extern int _old_proxy_connect_name_len(const struct d_resource *res, const struct connection *conn);
+extern char *_old_proxy_connection_name(char *conn_name, const struct d_resource *res, const struct connection *conn);
+#define old_proxy_connection_name(RES, CONN) \
+	_old_proxy_connection_name(alloca(_old_proxy_connect_name_len(RES, CONN)), RES, CONN)
 extern int _proxy_connect_name_len(const struct d_resource *res, const struct connection *conn);
 extern char *_proxy_connection_name(char *conn_name, const struct d_resource *res, const struct connection *conn);
 #define proxy_connection_name(RES, CONN) \
@@ -490,7 +497,6 @@ extern char* drbdsetup;
 extern char* drbdmeta;
 extern char* drbd_proxy_ctl;
 extern char* drbdadm_84;
-extern char ss_buffer[1024];
 extern const char *hostname;
 extern struct names backend_options;
 extern enum cfg_version config_version;
@@ -500,19 +506,11 @@ extern enum cfg_version config_version;
    frame is destroyed (=function returns), the allocated memory is
    freed automatically */
 
-/*
-  // This is the nicer version, that does not need the ss_buffer.
-  // But it only works with very new glibcs.
-
 #define ssprintf(...) \
-	 ({ int _ss_size = snprintf(0, 0, ##__VA_ARGS__);        \
+	({ int _ss_size = snprintf(0, 0, ##__VA_ARGS__);        \
 	 char *_ss_ret = __builtin_alloca(_ss_size+1);           \
 	 snprintf(_ss_ret, _ss_size+1, ##__VA_ARGS__);           \
 	 _ss_ret; })
-*/
-
-#define ssprintf(...) \
-	strcpy(alloca(snprintf(ss_buffer,sizeof(ss_buffer),##__VA_ARGS__)+1),ss_buffer)
 
 #ifndef offsetof
 /* I do not care about non GCC compilers */

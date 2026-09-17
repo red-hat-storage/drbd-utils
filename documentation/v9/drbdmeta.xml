@@ -22,6 +22,7 @@
     <cmdsynopsis sepchar=" ">
       <command moreinfo="none">drbdmeta</command>
       <arg choice="opt" rep="norepeat">--force</arg>
+      <arg choice="opt" rep="norepeat">--quiet</arg>
       <arg choice="opt" rep="norepeat">--ignore-sanity-checks</arg>
       <arg choice="req" rep="norepeat">
         <replaceable>device</replaceable>
@@ -81,7 +82,21 @@
         <term>--force</term>
         <listitem>
           <para><indexterm significance="normal"><primary>drbdmeta</primary><secondary>--force</secondary></indexterm>
-	    Assume yes as the answer to all questions drbdmeta would ask.</para>
+	    Assume yes as the answer to all questions drbdmeta would ask.
+	    Each auto-confirmed prompt is reported to standard error.
+	    Combine with <option>--quiet</option> to suppress these messages.</para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term>--quiet</term>
+        <listitem>
+          <para><indexterm significance="normal"><primary>drbdmeta</primary><secondary>--quiet</secondary></indexterm>
+	    When combined with <option>--force</option>, suppresses the
+	    informational messages and confirmation prompts that
+	    <option>--force</option> would otherwise auto-confirm and report.
+	    At the end of the run, a single summary line is printed to standard
+	    error stating how many confirmations were suppressed, but only if
+	    at least one was.  Has no effect without <option>--force</option>.</para>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -106,10 +121,17 @@
 	<term><option>create-md</option>
           <arg choice="req" rep="norepeat">number-of-bitmap-slots</arg>
 	  <arg choice="opt" rep="norepeat"><option>--peer-max-bio-size=</option><replaceable>val</replaceable></arg>
-	  <arg choice="opt" rep="norepeat"><option>--initialize-bitmap=</option><replaceable>{automatic|zeroout|pwrite|skip}</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--initialize-bitmap=</option><replaceable>{automatic|zeroout|pwrite|set-all|skip}</replaceable></arg>
 	  <arg choice="opt" rep="norepeat"><option>--al-stripes=</option><replaceable>val</replaceable></arg>
 	  <arg choice="opt" rep="norepeat"><option>--al-stripe-size-kB=</option><replaceable>val</replaceable></arg> (metadata version v09)
-	  <arg choice="opt" rep="norepeat"><option>--bitmap-block-size=</option><replaceable>val</replaceable></arg></term>
+	  <arg choice="opt" rep="norepeat"><option>--bitmap-block-size=</option><replaceable>val</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--peers=</option><replaceable>node-id-list</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--bitmap-slots=</option><replaceable>slot-list</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--initial-current-uuid=</option><replaceable>{generate|&lt;hex&gt;}</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--consistent</option></arg>
+	  <arg choice="opt" rep="norepeat"><option>--uptodate</option></arg>
+	  <arg choice="opt" rep="norepeat"><option>--peers-outdated</option></arg>
+	  <arg choice="opt" rep="norepeat"><option>--rotate-uuids</option></arg></term>
         <listitem>
 	  <para><indexterm
 	      significance="normal"><primary>drbdmeta</primary><secondary>create-md</secondary></indexterm>
@@ -142,7 +164,19 @@
 	    the kernel. This can make a noticable difference when initializing
 	    huge volumes. Default is <option>automatic</option>, which is
 	    zeroout with an implicit fallback to pwrite.
+	    <option>set-all</option> marks the whole device out of sync instead.
 	    </para>
+	  <para>
+	    When <option>create-md</option> converts existing metadata,
+	    <option>--initialize-bitmap</option> also overrides what the
+	    conversion would do to the bitmap on its own:
+	    <option>set-all</option> asks for a full resync, the zeroing
+	    variants declare the device in sync with the peer that keeps its
+	    bitmap slot, and <option>skip</option> leaves the bitmap area as it
+	    is on disk. Use <option>skip</option> with care: if the conversion
+	    changes the bitmap geometry, the bitmap area then holds bits that
+	    describe other blocks than DRBD will read them as.
+	  </para>
 	  <para>
 	    If you want to use more than 6433 activity log extents, or live on
 	    top of a spriped RAID, you may specify the number of stripes
@@ -164,6 +198,27 @@
 	    <command>drbdmeta 0 v08 /dev/vg23/lv42 internal create-md --al-stripes 7 --al-stripe-size 64</command>
 	  </para>
 	  <para>
+	    When <option>create-md</option> converts existing metadata, the two
+	    options change the activity log geometry of that metadata as well.
+	    The activity log sits next to the bitmap, so another geometry moves
+	    the bitmap: the activity log is re-created, and the bitmap with it.
+	    Where the bitmap being replaced tracks out-of-sync blocks, that costs
+	    a resync of the whole device, and <option>create-md</option> asks
+	    first. Without the two options the conversion keeps the geometry the
+	    metadata carries, and the out-of-sync blocks with it. Unapplied
+	    activity log transactions are lost either way.
+	  </para>
+	  <para>
+	    A numeric <replaceable>index</replaceable> names a slot of fixed size
+	    and fixed offsets, which holds one 32 KiB activity log stripe and
+	    4096 bytes per bitmap bit, and nothing else; DRBD refuses to attach
+	    anything else. Both <option>--al-stripes</option> /
+	    <option>--al-stripe-size-kB</option> and
+	    <option>--bitmap-block-size</option> therefore need a metadata device
+	    of their own, or one of the flexible layouts, which size themselves
+	    after the device.
+	  </para>
+	  <para>
 	    With the <option>--bitmap-block-size</option> option you can change the
 	    change-tracking bitmap's granularity from 4KiB to another
 	    value. Allowed values are: 4k, 8k, 16k, 32k, 64k, 128k, 256k, 512k,
@@ -174,6 +229,97 @@
 	    modified block up to a complete bitmap block for change tracking,
 	    and later resync.
 	  </para>
+	  <para>
+	    Note that DRBD 8.4 and older only know the 4KiB granularity.
+	    Converting such metadata to <literal>v08</literal> therefore
+	    re-creates the bitmap with 4KiB per bit, which needs more bits, and
+	    with internal metadata thus more space, for the same device. If the
+	    last agreed device size leaves no room for that, the conversion is
+	    refused: shrink the file system and the DRBD device first, while
+	    still running DRBD 9.
+	  </para>
+	  <para>
+	    DRBD 8.4 and older also have a single bitmap slot, so converting
+	    metadata that has more than one drops all but one of them, and
+	    re-creates the bitmap. Which slot survives has to be clear:
+	    <option>--peers</option> names it by the node id of the peer
+	    that owns it, <option>--bitmap-slots</option> by slot number.
+	    Use the slot number for a slot that no peer owns any more, which is
+	    what <option>forget-peer</option> leaves behind. Both options take a
+	    comma separated list, or a mask in hexadecimal, so that they can also
+	    express a conversion that keeps more than one slot; naming more than
+	    the conversion keeps is refused, and a conversion to
+	    <literal>v08</literal> keeps one. If nothing is named, and more than
+	    one slot is in use, the conversion is refused and lists the
+	    candidates; a single slot in use is unambiguous and is kept. The peer
+	    that owns the kept slot provides the bitmap UUID and the peer flags
+	    of the <literal>v08</literal> metadata. If that slot tracks anything out
+	    of sync, the whole device has to be marked out of sync, and
+	    <command>drbdmeta</command> asks before it does: a few out-of-sync
+	    blocks would become a resync of the whole device, so bringing the
+	    device in sync while still running DRBD 9 is usually the better
+	    order.
+	    Only the slot that is kept decides the state of the new bitmap: if it
+	    tracks nothing out of sync, the new bitmap is all clear, even when a
+	    dropped slot did track something. If it does, the whole device is
+	    marked out of sync, because a bit of the old bitmap does not describe
+	    the same blocks as a bit of the new one.
+	  </para>
+	  <para>
+	    Both of these re-create the bitmap, because the metadata is converted
+	    where it lies and the bitmap area moves.  The
+	    <option>convert-dump</option> command converts a dump instead.  A
+	    dump has one bitmap section per slot, rather than the interleaved
+	    on-disk layout, so the out-of-sync state survives.  Use it where a
+	    full resync after the conversion is worth avoiding.
+	  </para>
+	  <para>
+	    In the other direction, <literal>v08</literal> metadata knows one
+	    peer, and no node ids: neither the one of that peer, nor its own.
+	    What it says about that peer -- the peer flags and the bitmap UUID --
+	    goes to every peer entry, since none of them has seen our data. The
+	    one bitmap slot stays unassigned; DRBD 9 hands it to the peer that
+	    connects first.
+	  </para>
+  <para>
+    The following options are available for metadata version v09 only.
+    They are intended for use when pre-provisioning metadata without an initial full sync.
+  </para>
+  <para>
+    <option>--initial-current-uuid=</option><replaceable>{generate|&lt;hex&gt;}</replaceable>
+    sets the initial <literal>current_uuid</literal> instead of leaving
+    it at the sentinel value <literal>UUID_JUST_CREATED</literal>.
+    Use <option>generate</option> to let <command>drbdmeta</command>
+    pick a random value, or supply an explicit 64-bit hex value.
+    Bit 0 is silently cleared (it is reserved by the DRBD module);
+    the resulting value must not be zero.
+  </para>
+  <para>
+    <option>--consistent</option> sets the
+    <literal>MDF_CONSISTENT</literal> flag on the local device,
+    indicating that its data is consistent.
+    If no <option>--initial-current-uuid</option> is given, a random
+    UUID is generated automatically.
+  </para>
+  <para>
+    <option>--uptodate</option> sets both
+    <literal>MDF_CONSISTENT</literal> and
+    <literal>MDF_WAS_UP_TO_DATE</literal> on the local device,
+    marking it as the authoritative copy.
+    If no <option>--initial-current-uuid</option> is given, a random
+    UUID is generated automatically.
+  </para>
+  <para>
+    <option>--peers-outdated</option> sets
+    <literal>MDF_PEER_OUTDATED</literal> on every peer slot.
+  </para>
+  <para>
+    <option>--rotate-uuids</option> performs a UUID rotation: the
+    current UUID (which will be generated if not provided using <option>--initial-current-uuid</option>)
+    is written into every peer's <literal>bitmap_uuid</literal> slot and
+    into <literal>history_uuids[0]</literal>, and a fresh random value
+    becomes the new <literal>current_uuid</literal>.
+  </para>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -294,13 +440,95 @@
         </listitem>
       </varlistentry>
       <varlistentry>
-        <term><option>restore-md</option> <replaceable>dump_file</replaceable></term>
+        <term><option>restore-md</option> <replaceable>dump_file</replaceable>
+	  <arg choice="opt" rep="norepeat"><option>--max-peers=</option><replaceable>val</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--peers=</option><replaceable>node-id-list</replaceable></arg></term>
         <listitem>
           <para><indexterm significance="normal"><primary>drbdmeta</primary><secondary>restore-md </secondary></indexterm>
 	    Replace the metadata on the device with the contents of
 	    <replaceable>dump_file</replaceable>.  The dump file format is
 	    defined by the output of the <option>dump-md</option> command.
+	    The metadata is laid out for what the dump says, including a
+	    <literal>bm-byte-per-bit</literal> other than 4096 and an activity
+	    log geometry other than the default.
 	</para>
+	  <para>
+	    <option>--max-peers</option> writes a different number of bitmap
+	    slots than the dump has, keeping the data generation identifiers
+	    that <option>create-md</option> would discard. The dump holds one
+	    <literal>bitmap[N]</literal> section per slot, so the slots are
+	    re-numbered rather than re-interleaved.
+	  </para>
+	  <para>
+	    Fewer slots than the dump has drop the ones that no peer owns
+	    first. If the peers still own more slots than remain, the choice is
+	    refused and the candidates are listed;
+	    <option>--peers</option> then names the peers whose slots to keep.
+	    A kept slot takes the lowest free number, and its peer entry
+	    follows it.
+	  </para>
+	  <para>
+	    More slots than the dump has take their content from a slot that no
+	    peer owns. Those all track from day0, so any of them will do; if the
+	    dump has none, the added slots come out all set, which is the state
+	    <option>forget-peer</option> leaves behind. A peer entry that the
+	    dump points at one of the added slots gets the day0 bitmap UUID, the
+	    one shared by the peers that have not seen our data. With internal
+	    metadata the added slots take their space from the data area; if the
+	    last agreed device size no longer fits, the restore is refused.
+	  </para>
+	  <para>
+	    The same holds for a dump whose <literal>bm-byte-per-bit</literal>
+	    differs from the metadata in place: the offsets follow the bitmap
+	    the dump asks for, and a finer bitmap that no longer leaves room for
+	    the last agreed device size is refused.
+	  </para>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><option>convert-dump</option> <replaceable>dump_file</replaceable>
+	  <arg choice="opt" rep="norepeat"><option>--peers=</option><replaceable>node-id-list</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--bitmap-slots=</option><replaceable>slot-list</replaceable></arg>
+	  <arg choice="opt" rep="norepeat"><option>--bitmap-block-size=</option><replaceable>val</replaceable></arg></term>
+        <listitem>
+          <para><indexterm significance="normal"><primary>drbdmeta</primary><secondary>convert-dump </secondary></indexterm>
+	    Read <replaceable>dump_file</replaceable> and write a dump of the
+	    metadata version named on the command line to standard output.  A
+	    dump names its own version, so the dump is the source and the
+	    command line names the target.  The device is not touched; feed the
+	    result to <option>restore-md</option> to write it.
+	  </para>
+	  <para>
+	    <command>drbdmeta - v08 /dev/vg23/lv42 internal convert-dump v09.txt --peers 2 &gt; v08.txt</command>
+	    <?linebreak?>
+	    <command>drbdmeta - v08 /dev/vg23/lv42 internal restore-md v08.txt</command>
+	  </para>
+	  <para>
+	    <literal>v09</literal> to <literal>v08</literal> is the rollback to
+	    DRBD 8.4. <option>create-md</option> converts the metadata where it
+	    lies and has to re-create the bitmap;
+	    <option>convert-dump</option> re-writes the bitmap section of the
+	    slot that survives, so the out-of-sync state of that peer reaches
+	    the <literal>v08</literal> metadata instead of a full resync.
+	    <option>--peers</option> and <option>--bitmap-slots</option> name
+	    the slot to keep, as they do for the conversion in place, and
+	    <command>drbdmeta</command> reports the out-of-sync bits it drops
+	    with the other slots. Where no slot survives at all, there is nobody
+	    to attribute those bits to, and the conversion is refused.
+	  </para>
+	  <para>
+	    Either version written as itself changes nothing, except that
+	    <option>--bitmap-block-size</option> gives a <literal>v09</literal>
+	    dump a different number of bytes per bitmap bit. A target bit is set
+	    if any source bit covering the same byte range is set. A finer
+	    bitmap repeats every source bit and loses nothing; a coarser one
+	    or-s them together, which can only add out-of-sync, never drop it.
+	  </para>
+	  <para>
+	    Other directions are refused. Converting <literal>v08</literal>
+	    metadata to <literal>v09</literal> is what
+	    <option>create-md</option> does, and it keeps the bitmap as it is.
+	  </para>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -317,7 +545,7 @@
   </refsect1>
   <refsect1>
     <title>Reporting Bugs</title>
-    <simpara>Report bugs to <email>drbd-user@lists.linbit.com</email>.
+    <simpara>Report bugs at <ulink url="https://github.com/LINBIT/drbd-utils/issues">https://github.com/LINBIT/drbd-utils/issues</ulink>.
     </simpara>
   </refsect1>
   <refsect1>

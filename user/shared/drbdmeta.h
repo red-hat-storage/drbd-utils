@@ -72,6 +72,7 @@ struct md_cpu {
 	uint32_t al_stripes;
 	uint32_t al_stripe_size_4k;
 	uint64_t members;
+	uint64_t features;
 };
 
 /*
@@ -212,5 +213,6 @@ extern int opened_odirect;
 extern int verbose;
 extern int dry_run;
 extern int force;
+extern int quiet;
 
 #endif

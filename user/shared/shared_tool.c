@@ -43,6 +43,9 @@
 const char *IPV4_STR = "ipv4";
 const char *IPV6_STR = "ipv6";
 
+/* Defined in drbdmeta.c; defaults to 0 in binaries that do not implement --quiet. */
+int quiet __attribute__((weak)) = 0;
+
 const char* shell_escape(const char* s)
 {
 	/* ugly static buffer. so what. */
@@ -202,10 +205,13 @@ int sget_token(char *s, int size, const char** text)
 	return 1;
 }
 
+const char *drbd_lib_dir_override = NULL;
+
 char *lk_bdev_path(unsigned minor)
 {
+	const char *libdir = drbd_lib_dir_override ? drbd_lib_dir_override : drbd_lib_dir();
 	char *path;
-	m_asprintf(&path, "%s/drbd-minor-%d.lkbd", drbd_lib_dir(), minor);
+	m_asprintf(&path, "%s/drbd-minor-%d.lkbd", libdir, minor);
 	return path;
 }
 
@@ -288,7 +294,7 @@ int lk_bdev_load(const unsigned minor, struct bdev_info *bd)
 	path = lk_bdev_path(minor);
 	fp = fopen(path, "r");
 	if (!fp) {
-		if (errno != ENOENT)
+		if (errno != ENOENT && !quiet)
 			fprintf(stderr, "lk_bdev_load(%s) failed: %m\n", path);
 		goto out;
 	}
