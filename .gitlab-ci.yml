@@ -3,7 +3,7 @@ stages:
   - test
 
 variables:
-  BUILD_HELPERS_VERSION: 1aac59c8c8c2559448851ca5c6820fcf3a363363
+  BUILD_HELPERS_VERSION: 0fa86e05314b906db34862d95e81b598dc029fa1
   DRBD9_TESTS_REF: master
   # we have to change the way GitLab CI clones the repository.
   # by default, it is shallow, which gives us a wrong commit count when
@@ -14,9 +14,10 @@ variables:
 
 .setup-lbbuild:
   before_script:
-    - . .gitlab/gitlab-utils.sh
-    - drbd_prepare_tools
-    - drbd_fetch_lbbuildctl
+    - . gitlab-utils.sh
+    - ci_prepare_tools
+    - ci_fetch_rq
+    - ci_fetch_lbbuildctl
     - git clone --branch ${DRBD9_TESTS_REF} https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/drbd/drbd9-tests.git
     - |
       drbd_utils_build () {
@@ -24,7 +25,7 @@ variables:
         local release="$2"
 
         dummy-release.sh drbd-utils "$version" "$release" drbd.spec.in
-        sed -i "s/^AC_INIT.*/AC_INIT(DRBD, $version, [drbd-dev@lists.linbit.com])/" configure.ac
+        sed -i "s/^AC_INIT.*/AC_INIT(DRBD, $version, [drbd-dev@lists.linux.dev])/" configure.ac
         git config --global user.email "invalid@linbit"
         git config --global user.name "Dummy"
         git commit -am "CI $version - $release"
@@ -32,7 +33,11 @@ variables:
         ./configure --prefix=/usr --localstatedir=/var --sysconfdir=/etc --without-manual
         install /dev/null $(which lbvers.py)
         make debrelease VERSION="$version" FORCE=1
-        curl -isSf -u $LINBIT_REGISTRY_USER:$LINBIT_REGISTRY_PASSWORD --upload-file drbd-utils-*.tar.gz $LINBIT_REGISTRY_URL/repository/lbbuild-upstream/
+        local tarball
+        tarball=$(ls drbd-utils-*.tar.gz)
+        pulp file content upload --repository lbbuild-upstream \
+          --file "$tarball" \
+          --relative-path "$tarball"
 
         # Distributions, comma separated.
         # * "mainline" is excluded because the user space components are the same as the base distribution.
@@ -41,13 +46,10 @@ variables:
           .vms[].metadata.BuildDistribution
           | values
           | select(. != "mainline")
-          | sub("rhel(?<major>\\d)\\.\\d"; "rhel\(.major).0")
+          | sub("rhel(?<major>\\d+)\\.\\d+"; "rhel\(.major).0")
         ] | unique | join(",")')
 
         lbbuildctl build drbd-utils --arch amd64 --ci -v "$DRBD_UTILS_VERSION" \
-          -e LINBIT_REGISTRY_USER=$LINBIT_REGISTRY_USER \
-          -e LINBIT_REGISTRY_PASSWORD=$LINBIT_REGISTRY_PASSWORD \
-          -e LINBIT_REGISTRY_URL=$LINBIT_REGISTRY_URL \
           -d $dists
       }
 
@@ -65,11 +67,16 @@ build:
     paths:
       - download
   script:
+    # Other projects pin the master build as "9.0.0.latest-*", so that name
+    # must stay. Merge request builds use 9.99.0.<sha> so that they sort above
+    # every release: the packaging tests upgrade from the latest release to
+    # the build under test, and version comparisons in the spec and control
+    # files (Obsoletes, Breaks, ...) only mean something that way.
     - if [ "$CI_COMMIT_BRANCH" = master ]; then
     -   DRBD_UTILS_VERSION=9.0.0.latest
     -   DRBD_UTILS_RELEASE=$(git rev-list --count origin/master)
     - else
-    -   DRBD_UTILS_VERSION=9.0.0.$CI_COMMIT_SHA
+    -   DRBD_UTILS_VERSION=9.99.0.$CI_COMMIT_SHA
     -   DRBD_UTILS_RELEASE=1
     - fi
     - drbd_utils_build $DRBD_UTILS_VERSION $DRBD_UTILS_RELEASE
@@ -98,7 +105,9 @@ drbd-utils-tests:
     paths:
       - "**/sanitizer.*.txt"
 
-drbd-tests:
+# Common setup for jobs that run VMs with vmshed on the libvirt runners:
+# drbd9-tests (VM definitions), build-helpers, rq, virter and vmshed.
+.setup-vmshed:
   stage: test
   rules:
     - if: $CI_MERGE_REQUEST_ID
@@ -111,7 +120,6 @@ drbd-tests:
       - download
   before_script:
     - git clone --branch ${DRBD9_TESTS_REF} https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/drbd/drbd9-tests.git
-  script:
     - . drbd9-tests/virter/version.env
     - git init build-helpers -q -b unused
     - git -C build-helpers fetch -q --depth 1 $CI_SERVER_PROTOCOL://gitlab-ci-token:${CI_JOB_TOKEN}@$CI_SERVER_HOST:$CI_SERVER_PORT/linbit/build-helpers.git $BUILD_HELPERS_VERSION
@@ -122,15 +130,6 @@ drbd-tests:
       ci_fetch_rq
       ci_fetch_binary virter virter-$VIRTER_VERSION https://github.com/LINBIT/virter/releases/download/$VIRTER_VERSION/virter-linux-amd64
       ci_fetch_binary vmshed vmshed-$VMSHED_VERSION https://github.com/LINBIT/vmshed/releases/download/$VMSHED_VERSION/vmshed-linux-amd64
-    - export DRBD_TEST_DOCKER_IMAGE=$LINBIT_DOCKER_REGISTRY/drbd9-tests:latest
-    - docker image pull $DRBD_TEST_DOCKER_IMAGE
-    - |
-      export DRBD_VERSION=9.2.0.latest
-      export DRBD_UTILS_VERSION=9.0.0.$CI_COMMIT_SHA-1
-      cd drbd9-tests
-      ./virter/run-test.sh --out-dir=../tests-out
-  dependencies:
-    - build
   artifacts:
     # provide a convenient name so that the downloaded artifacts can be identified
     name: $CI_PROJECT_NAME-$CI_JOB_ID
@@ -139,4 +138,35 @@ drbd-tests:
     when: always
     reports:
       junit: tests-out/test-results/*.xml
+
+drbd-tests:
+  extends: .setup-vmshed
+  script:
+    - export DRBD_TEST_DOCKER_IMAGE=$LINBIT_DOCKER_REGISTRY/drbd9-tests:latest
+    - docker image pull $DRBD_TEST_DOCKER_IMAGE
+    - |
+      export DRBD_VERSION=9.2.0.latest
+      export DRBD_UTILS_VERSION=9.99.0.$CI_COMMIT_SHA-1
+      ./drbd9-tests/virter/run-test.sh
+
+# Install the latest release, upgrade to the build under test, downgrade,
+# remove and purge the packages on every distribution we build for.
+# See tests/packaging/.
+packaging-tests:
+  extends: .setup-vmshed
+  script:
+    # The VM definitions come from drbd9-tests, the same source the build job
+    # derives its distribution list from.
+    - tests/packaging/gen-vms.sh drbd9-tests/virter/vms.toml > tests/packaging/vms.toml
+    - cat tests/packaging/vms.toml
+    - |
+      vmshed \
+        --quiet \
+        --out-dir "$(readlink -f tests-out)" \
+        --startvm 40 \
+        --nvms "${LINBIT_CI_MAX_CPUS:-20}" \
+        --vms tests/packaging/vms.toml \
+        --tests tests/packaging/tests.toml \
+        --pull-template "$LINBIT_DOCKER_REGISTRY/vm/drbd9-tests/{{ .Image }}:latest" \
+        --set values.DrbdUtilsVersion=9.99.0.$CI_COMMIT_SHA-1
 

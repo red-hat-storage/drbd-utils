@@ -72,7 +72,7 @@ struct field_def {
 };
 
 struct context_def {
-	struct nla_policy *nla_policy;
+	const struct nla_policy *nla_policy;
 	int nla_policy_size;
 	int nla_type;
 	struct field_def fields[];
@@ -111,6 +111,7 @@ extern struct context_def forceable_ctx;
 extern struct context_def adjust_ctx;
 extern struct context_def status_ctx;
 extern struct context_def repair_md_ctx;
+extern struct context_def dump_superblock_ctx;
 extern struct context_def peer_device_options_ctx;
 extern struct context_def handlers_ctx;
 extern struct context_def proxy_options_ctx;

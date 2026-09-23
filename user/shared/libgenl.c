@@ -44,6 +44,9 @@ static struct genl_sock *genl_connect(__u32 nl_groups, struct genl_connect_optio
 	};
 	struct genl_sock *s = calloc(1, sizeof(*s));
 	socklen_t sock_len;
+	/* Without CAP_NET_ADMIN, SO_RCVBUFFORCE fails with EPERM and a buffer
+	 * capped by net.core.rmem_max is expected; do not warn about it then. */
+	bool may_force_rcvbuf = true;
 	int bsz;
 
 	if (!opts)
@@ -75,8 +78,8 @@ static struct genl_sock *genl_connect(__u32 nl_groups, struct genl_connect_optio
 		goto fail;
 
 	sock_len = sizeof(s->s_local);
-	DO_OR_LOG_AND_FAIL(setsockopt(s->s_fd, SOL_SOCKET, SO_SNDBUF, &opts->sndbuf_size, sizeof(&opts->sndbuf_size)));
-	DO_OR_LOG_AND_FAIL(setsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUF, &opts->rcvbuf_size, sizeof(&opts->rcvbuf_size)));
+	DO_OR_LOG_AND_FAIL(setsockopt(s->s_fd, SOL_SOCKET, SO_SNDBUF, &opts->sndbuf_size, sizeof(opts->sndbuf_size)));
+	DO_OR_LOG_AND_FAIL(setsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUF, &opts->rcvbuf_size, sizeof(opts->rcvbuf_size)));
 	DO_OR_LOG_AND_FAIL(bind(s->s_fd, (struct sockaddr*) &s->s_local, sizeof(s->s_local)));
 	DO_OR_LOG_AND_FAIL(getsockname(s->s_fd, (struct sockaddr*) &s->s_local, &sock_len));
 
@@ -92,15 +95,20 @@ static struct genl_sock *genl_connect(__u32 nl_groups, struct genl_connect_optio
 	if (getsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUF, &bsz, &sock_len) == 0) {
 		if ((bsz/2) < opts->rcvbuf_size) {
 			/* retry with FORCE */
-			setsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUFFORCE, &opts->rcvbuf_size, sizeof(&opts->rcvbuf_size));
+			if (setsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUFFORCE,
+				       &opts->rcvbuf_size, sizeof(opts->rcvbuf_size)) != 0
+			&&  errno == EPERM)
+				may_force_rcvbuf = false;
 		}
 	}
 #endif
 	sock_len = sizeof(bsz);
-	if (getsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUF, &bsz, &sock_len) == 0
+	if (may_force_rcvbuf
+	&&  getsockopt(s->s_fd, SOL_SOCKET, SO_RCVBUF, &bsz, &sock_len) == 0
 	&&  (bsz/2) < opts->rcvbuf_size) {
-		dbg(1, "tried to set SO_RCVBUF %d, got %d; you may need to adjust sysctl net.core.rmem_max\n",
-			opts->rcvbuf_size, (bsz/2));
+		dbg(1, "tried to set SO_RCVBUF %d, got %d; you may need to adjust sysctl net.core.rmem_max;"
+			" or 'export DRBD_GENL_RCVBUF_SZ=%d' to silence this message\n",
+			opts->rcvbuf_size, (bsz/2), (bsz/2));
 	}
 
 	dbg(3, "bound socket to nl_pid:%u, my pid:%u, len:%u, sizeof:%u\n",
@@ -110,6 +118,8 @@ static struct genl_sock *genl_connect(__u32 nl_groups, struct genl_connect_optio
 	return s;
 
 fail:
+	if (s->s_fd != -1)
+		close(s->s_fd);
 	free(s);
 	return NULL;
 }
@@ -212,8 +222,12 @@ retry:
 	    msg.msg_flags & MSG_TRUNC) {
 		/* Provided buffer is not long enough, enlarge it
 		 * and try again. */
+		void *tmp;
 		iov->iov_len *= 2;
-		iov->iov_base = realloc(iov->iov_base, iov->iov_len);
+		tmp = realloc(iov->iov_base, iov->iov_len);
+		if (!tmp)
+			return -E_RCV_FAILED;
+		iov->iov_base = tmp;
 		goto retry;
 	} else if (flags != 0) {
 		/* Buffer is big enough, do the actual reading */

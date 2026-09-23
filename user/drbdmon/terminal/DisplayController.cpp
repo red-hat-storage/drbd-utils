@@ -23,6 +23,11 @@
 #include <terminal/MDspMessage.h>
 #include <terminal/MDspPgmInfo.h>
 #include <terminal/MDspConfiguration.h>
+#include <terminal/MDspSelectionFilter.h>
+#include <terminal/MDspBulkActions.h>
+#include <terminal/MDspExportSelection.h>
+#include <terminal/MDspImportSelection.h>
+#include <terminal/MDspOverview.h>
 #include <terminal/InputField.h>
 #include <terminal/DisplayConsts.h>
 #include <terminal/DisplayUpdateEvent.h>
@@ -61,7 +66,12 @@ DisplayController::DisplayController(
     term_size_mgr = std::unique_ptr<PosixTermSize>(new PosixTermSize());
     dsp_styles_mgr = std::unique_ptr<DisplayStyleCollection>(new DisplayStyleCollection());
     ansi_ctl_mgr = std::unique_ptr<AnsiControl>(new AnsiControl());
-    sub_proc_queue_mgr = std::unique_ptr<SubProcessQueue>(new SubProcessQueue());
+    {
+        const uint16_t taskq_concurrency = mon_env.config->taskq_concurrency;
+        sub_proc_queue_mgr = std::unique_ptr<SubProcessQueue>(
+            new SubProcessQueue(taskq_concurrency)
+        );
+    }
 
     // Enable DRBD actions/commands if tracking live events, and not an events log file
     dsp_comp_hub_mgr->enable_drbd_actions   = events_file.empty();
@@ -248,6 +258,21 @@ DisplayController::DisplayController(
         config_mgr = std::unique_ptr<ModularDisplay>(
             dynamic_cast<ModularDisplay*> (new MDspConfiguration(*dsp_comp_hub_mgr, *(mon_env.config)))
         );
+        slct_filter_mgr = std::unique_ptr<ModularDisplay>(
+            dynamic_cast<ModularDisplay*> (new MDspSelectionFilter(*dsp_comp_hub_mgr))
+        );
+        bulk_actions_mgr = std::unique_ptr<ModularDisplay>(
+            dynamic_cast<ModularDisplay*> (new MDspBulkActions(*dsp_comp_hub_mgr))
+        );
+        export_slct_mgr = std::unique_ptr<ModularDisplay>(
+            dynamic_cast<ModularDisplay*> (new MDspExportSelection(*dsp_comp_hub_mgr))
+        );
+        import_slct_mgr = std::unique_ptr<ModularDisplay>(
+            dynamic_cast<ModularDisplay*> (new MDspImportSelection(*dsp_comp_hub_mgr))
+        );
+        overview_mgr = std::unique_ptr<ModularDisplay>(
+            dynamic_cast<ModularDisplay*> (new MDspOverview(*dsp_comp_hub_mgr))
+        );
 
         wait_msg_mgr = std::unique_ptr<MDspWaitMsg>(new MDspWaitMsg(dsp_comp_hub));
 
@@ -263,6 +288,11 @@ DisplayController::DisplayController(
             dsp_io->write_text(ansi_ctl->ANSI_MOUSE_ON.c_str());
         }
         dsp_io->write_text(ansi_ctl->ANSI_CLEAR_SCREEN.c_str());
+        dsp_io->flush();
+
+        // From here on, all display output is painted into the screen buffer, so that only
+        // the parts of the terminal that actually change are updated
+        dsp_io->enable_screen_buffer(dsp_comp_hub_mgr->term_cols, dsp_comp_hub_mgr->term_rows);
     }
 
     dsp_comp_hub_mgr->verify();
@@ -282,11 +312,15 @@ DisplayController::~DisplayController() noexcept
     AnsiControl* ansi_ctl = dsp_comp_hub_mgr->ansi_ctl;
     DisplayIo* dsp_io = dsp_comp_hub_mgr->dsp_io;
 
+    dsp_io->flush();
+    dsp_io->disable_screen_buffer();
+
     dsp_io->write_text(ansi_ctl->ANSI_CURSOR_ON.c_str());
     dsp_io->write_text(ansi_ctl->ANSI_MOUSE_OFF.c_str());
     dsp_io->write_text(ansi_ctl->ANSI_ALTBFR_OFF.c_str());
 
     dsp_io->write_text(ansi_ctl->ANSI_CLEAR_SCREEN.c_str());
+    dsp_io->flush();
 
     DisplayStack::ValuesIterator iter(*dsp_stack);
     while (iter.has_next())
@@ -324,8 +358,10 @@ DisplayController::~DisplayController() noexcept
     }
 
     dsp_io->write_text("Waiting for the external processes to exit: ");
+    dsp_io->flush();
     sub_proc_queue_mgr = nullptr;
     dsp_io->write_text("done.\n");
+    dsp_io->flush();
 }
 
 void DisplayController::initialize()
@@ -357,6 +393,7 @@ void DisplayController::exit_initial_display()
     {
         switch_active_display(resource_view_mgr.get(), DisplayId::display_page::RSC_LIST, true);
     }
+    dsp_comp_hub_mgr->dsp_io->flush();
 }
 
 bool DisplayController::notify_drbd_changed()
@@ -414,6 +451,15 @@ void DisplayController::terminal_size_changed_impl() noexcept
             dsp_comp_hub.term_rows - DisplayConsts::CMD_LINE_Y
         );
         dsp_comp_hub.command_line->set_field_length(dsp_comp_hub.term_cols - DisplayConsts::CMD_LINE_X + 1);
+
+        try
+        {
+            dsp_comp_hub.dsp_io->set_screen_dimensions(dsp_comp_hub.term_cols, dsp_comp_hub.term_rows);
+        }
+        catch (std::bad_alloc&)
+        {
+            // Out of memory, continue with the screen buffer's previous dimensions
+        }
     }
 }
 
@@ -426,6 +472,8 @@ void DisplayController::key_pressed(const uint32_t key)
     else
     if (key == KeyCodes::FUNC_05)
     {
+        // The contents of the terminal may have been damaged by another program
+        dsp_comp_hub_mgr->dsp_io->invalidate_screen();
         display();
     }
     else
@@ -434,6 +482,7 @@ void DisplayController::key_pressed(const uint32_t key)
         active_display->key_pressed(key);
         cond_refresh_display();
     }
+    dsp_comp_hub_mgr->dsp_io->flush();
 }
 
 void DisplayController::mouse_action(MouseEvent& mouse)
@@ -443,11 +492,13 @@ void DisplayController::mouse_action(MouseEvent& mouse)
         active_display->mouse_action(mouse);
         cond_refresh_display();
     }
+    dsp_comp_hub_mgr->dsp_io->flush();
 }
 
 void DisplayController::display()
 {
     ComponentsHub& dsp_comp_hub = *dsp_comp_hub_mgr;
+    dsp_comp_hub.dsp_io->begin_frame();
     dsp_comp_hub.dsp_io->write_text(dsp_comp_hub.ansi_ctl->ANSI_CURSOR_OFF.c_str());
     if (dsp_comp_hub.have_term_size)
     {
@@ -464,6 +515,8 @@ void DisplayController::display()
     {
         terminal_size_error();
     }
+    dsp_comp_hub.dsp_io->end_frame();
+    dsp_comp_hub.dsp_io->flush();
 }
 
 void DisplayController::terminal_size_error()
@@ -772,6 +825,21 @@ void DisplayController::get_display(
             break;
         case DisplayId::display_page::CONFIGURATION:
             dsp_obj = config_mgr.get();
+            break;
+        case DisplayId::display_page::SLCT_FILTER:
+            dsp_obj = slct_filter_mgr.get();
+            break;
+        case DisplayId::display_page::BULK_ACT:
+            dsp_obj = bulk_actions_mgr.get();
+            break;
+        case DisplayId::display_page::EXPORT_SLCT:
+            dsp_obj = export_slct_mgr.get();
+            break;
+        case DisplayId::display_page::IMPORT_SLCT:
+            dsp_obj = import_slct_mgr.get();
+            break;
+        case DisplayId::display_page::OVERVIEW:
+            dsp_obj = overview_mgr.get();
             break;
         default:
             break;

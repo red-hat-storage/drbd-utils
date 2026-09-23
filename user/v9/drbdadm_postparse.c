@@ -352,6 +352,21 @@ void set_me_in_resource(struct d_resource* res, int match_on_proxy)
 			res->stacked = 1;
 	}
 
+	/* If normal matching found nothing and this is not already a proxy-aware
+	 * call, try matching as a dedicated proxy node.  Do not break on first
+	 * match: multiple hosts may have proxy entries for this node, and all
+	 * need used_as_me set so their paths get my_address and my_proxy
+	 * assigned below. */
+	if (!res->me && !match_on_proxy) {
+		for_each_host(host, &res->all_hosts) {
+			if (!test_proxy_on_host(res, host))
+				continue;
+			res->me = host;
+			host->used_as_me = 1;
+			res->proxy_only = 1;
+		}
+	}
+
 	/* If there is no me, implicitly ignore that resource */
 	if (!res->me) {
 		res->ignore = 1;
@@ -501,11 +516,36 @@ static void add_no_bitmap_opt(struct d_resource *res)
 			continue;
 
 		STAILQ_FOREACH(peer_device, &conn->peer_devices, connection_link) {
-			if (peer_device->connection->peer && peer_diskless(peer_device))
+			if (peer_device->connection->peer && peer_diskless(peer_device) &&
+			    !find_opt(&peer_device->pd_options, "bitmap"))
 				insert_tail(&peer_device->pd_options, new_opt("bitmap", "no"));
 		}
 	}
 	res->no_bitmap_done = 1;
+}
+
+static void apply_tiebreaker_flags(struct d_resource *res)
+{
+	struct connection *conn;
+
+	for_each_connection(conn, &res->connections) {
+		struct peer_device *peer_device;
+
+		if (conn->ignore || !conn->peer)
+			continue;
+
+		STAILQ_FOREACH(peer_device, &conn->peer_devices, connection_link) {
+			struct d_volume *peer_vol;
+
+			peer_vol = volume_by_vnr(&conn->peer->volumes, peer_device->vnr);
+			if (!peer_vol || peer_vol->tiebreaker)
+				continue;
+
+			if (!find_opt(&peer_device->pd_options, "peer-tiebreaker"))
+				insert_tail(&peer_device->pd_options,
+					    new_opt(strdup("peer-tiebreaker"), strdup("no")));
+		}
+	}
 }
 
 void set_peer_in_resource(struct d_resource* res, int peer_required)
@@ -525,8 +565,10 @@ void set_peer_in_resource(struct d_resource* res, int peer_required)
 	}
 	res->peers_addrs_set = peers_addrs_set;
 
-	if (!(peer_required & DRBDSETUP_SHOW))
+	if (!(peer_required & DRBDSETUP_SHOW)) {
 		add_no_bitmap_opt(res);
+		apply_tiebreaker_flags(res);
+	}
 }
 
 void set_stacked_disk_in_res(struct d_resource *res)
@@ -1405,7 +1447,12 @@ static void sanity_check_cmd(char *cmd_name)
 	if (strchr(cmd_name, '/')) {
 		sanity_check_abs_cmd(cmd_name);
 	} else {
-		path = pp = c = strdup(getenv("PATH"));
+		const char *env_path = getenv("PATH");
+
+		if (!env_path)
+			return; /* without a PATH there is nothing to search */
+
+		path = pp = c = strdup(env_path);
 
 		while (1) {
 			c = strchr(pp, ':');
