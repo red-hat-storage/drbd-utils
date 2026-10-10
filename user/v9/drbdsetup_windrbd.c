@@ -14,7 +14,7 @@ bool kernel_older_than(int version, int patchlevel, int sublevel)
 }
 
 int conv_block_dev(struct drbd_argument *ad, struct msg_buff *msg,
-		   struct drbd_genlmsghdr *dhdr, char* arg)
+		   enum drbd_nl_attr_set set, char* arg)
 {
 	/* we want to do simple conversions
 		as C: -> \\DosDevices\\C: and GUIDs to
@@ -36,7 +36,7 @@ int conv_block_dev(struct drbd_argument *ad, struct msg_buff *msg,
 		fprintf(stderr, "Device name too long: %s (%zd), please report this.\n", arg, n);
 		return OTHER_ERROR;
 	}
-	nla_put_string(msg, ad->nla_type, device);
+	nla_put_string(msg, nl->attr_id(set, ad->nla_type), device);
 
 	return NO_ERROR;
 }
@@ -164,5 +164,18 @@ int modprobe_drbd(void)
 		}
 	}
 	return 1;
+}
+
+/* Windrbd speaks the legacy family only. */
+struct genl_sock *drbd_nl_connect(struct genl_connect_options *opts)
+{
+	struct genl_sock *s = genl_connect_to_family(legacy_dialect.family, opts);
+
+	if (!s || !s->s_family) {
+		fprintf(stderr, "Could not connect to 'drbd' generic netlink family\n");
+		return NULL;
+	}
+	nl = &legacy_dialect;
+	return s;
 }
 
