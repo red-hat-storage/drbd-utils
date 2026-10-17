@@ -7,22 +7,12 @@
 #include "libgenl.h"
 #include "linux/drbd_genl_userspace.h"
 #include <linux/types.h>
-
-
-#define OTHER_ERROR 900
-#define ERR_MODULE_UNLOADED 901
+#include "drbdsetup_nl.h"
 
 /* EXIT code to map ERR_MODULE_UNLOADED to */
 #define ERR_EXIT_MODULE_UNLOADED  121
 
 #define ADDRESS_STR_MAX 256
-
-/* is_intentional is a boolean value we get via nl from kernel. if we use new
- * utils and old kernel we don't get it, so we set this default, get kernel
- * info, and then decide from the value if the kernel was new enough */
-#define IS_INTENTIONAL_DEF 3
-/* same for DEV_IS_OPEN */
-#define DEV_IS_OPEN_UNKNOWN 3
 
 
 /* Used as base value, for getopt_long()'s options to express
@@ -30,17 +20,18 @@
  */
 #define OPT_ALT_BASE 1000
 
-/* In the 8.4 time the command understood this option. */
+/* getopt_long()'s value for an option only the 8.4 drbdsetup knows. */
 #define OPT_COMPAT84 2000
 
 
 struct drbd_argument {
 	const char* name;
-	__u16 nla_type;
+	__u16 nla_type;		/* neutral (legacy) attribute id */
 	int (*convert_function)(struct drbd_argument *,
 				struct msg_buff *,
-				struct drbd_genlmsghdr *dhdr,
+				enum drbd_nl_attr_set,
 				char *);
+	bool in_context;	/* goes into the object's identity, not the option nest */
 };
 
 /* Configuration requests typically need a context to operate on.
@@ -98,11 +89,11 @@ struct reply_ctx {
 struct drbd_cmd {
 	const char* cmd;
 	enum cfg_ctx_key ctx_key;
-	int cmd_id;
-	int tla_id; /* top level attribute id */
+	enum drbd_nl_cmd cmd_id;
+	enum drbd_nl_attr_set tla_id; /* the request's attribute set */
 	int (*function)(const struct drbd_cmd *, int, char **);
 	struct drbd_argument *drbd_args;
-	int (*handle_reply)(const struct drbd_cmd*, struct genl_info *, struct reply_ctx *);
+	int (*handle_reply)(const struct drbd_cmd*, struct drbd_nl_event *, struct reply_ctx *);
 	struct option *options;
 	bool missing_ok;
 	bool continuous_poll;
@@ -110,9 +101,7 @@ struct drbd_cmd {
 	bool lockless;
 	struct context_def *ctx;
 	const char *summary;
-#ifdef WITH_84_SUPPORT
-	struct field_def *compat_84_fields;
-#endif
+	struct option *compat_84_options; /* to recognize 8.4 syntax */
 };
 
 enum {
@@ -191,27 +180,9 @@ extern bool opt_statistics;
 extern bool opt_timestamps;
 extern bool opt_diff;
 extern bool opt_fullch;
-extern struct drbd_cfg_context global_ctx;
-extern enum cfg_ctx_key context;
-extern unsigned int minor;
-extern const struct drbd_cmd new_resource_cmd;
-extern const struct drbd_cmd new_minor_cmd;
-extern const struct drbd_cmd attach_cmd;
-extern const struct drbd_cmd connect_cmd;
-extern const struct drbd_cmd new_peer_cmd;
-extern const struct drbd_cmd del_peer_cmd;
-extern const struct drbd_cmd new_path_cmd;
-extern const struct drbd_cmd del_path_cmd;
-extern const struct drbd_cmd disconnect_cmd;
-extern const struct drbd_cmd peer_device_options_cmd;
-
-struct option *make_longoptions(const struct drbd_cmd *cm, bool accept_84_compat);
-int _generic_config_cmd(const struct drbd_cmd *cm, int argc, char **argv);
-void print_command_usage(const struct drbd_cmd *cm, enum usage_type);
-int sockaddr_from_str(struct sockaddr_storage *storage, const char *str);
 
 bool kernel_older_than(int version, int patchlevel, int sublevel);
-int conv_block_dev(struct drbd_argument *ad, struct msg_buff *msg, struct drbd_genlmsghdr *dhdr, char* arg);
+int conv_block_dev(struct drbd_argument *ad, struct msg_buff *msg, enum drbd_nl_attr_set set, char* arg);
 char *kernel_device_to_userland_device(char *kernel_dev);
 int genl_join_mc_group_and_ctrl(struct genl_sock *s, const char *name);
 int poll_hup(struct genl_sock *s, int timeout_ms, int extra_poll_fd);
@@ -241,11 +212,11 @@ void print_peer_device_statistics(int indent,
 				  wrap_printf_fn_t wrap_printf);
 __attribute__((format(printf, 2, 3)))
 int nowrap_printf(int indent, const char *format, ...);
-struct resources_list *new_resource_from_info(struct genl_info *info);
-struct devices_list *new_device_from_info(struct genl_info *info);
-struct connections_list *new_connection_from_info(struct genl_info *info);
-struct peer_devices_list *new_peer_device_from_info(struct genl_info *info);
-struct paths_list *new_path_from_info(struct genl_info *info);
+struct resources_list *new_resource_from_event(const struct drbd_nl_event *ev);
+struct devices_list *new_device_from_event(const struct drbd_nl_event *ev);
+struct connections_list *new_connection_from_event(const struct drbd_nl_event *ev);
+struct peer_devices_list *new_peer_device_from_event(const struct drbd_nl_event *ev);
+struct paths_list *new_path_from_event(const struct drbd_nl_event *ev);
 void free_resources(struct resources_list *);
 void free_device(struct devices_list *);
 void free_devices(struct devices_list *);
@@ -254,7 +225,6 @@ void free_connections(struct connections_list *);
 void free_peer_device(struct peer_devices_list *);
 void free_peer_devices(struct peer_devices_list *);
 void free_paths(struct paths_list *);
-int drbd_tla_parse(struct nlattr *tla[], struct nlmsghdr *nlh);
 
 int drbdsetup_main(int argc, char **argv);
 
