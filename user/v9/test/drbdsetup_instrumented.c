@@ -37,9 +37,7 @@
 
 #include "drbd_protocol.h"
 
-int print_event(const struct drbd_cmd *cm, struct genl_info *info, struct reply_ctx *rctx);
-
-extern struct genl_family drbd_genl_family;
+int print_event(const struct drbd_cmd *cm, struct drbd_nl_event *ev, struct reply_ctx *rctx);
 
 static char *test_resource_name = "some-resource";
 static __u32 test_node_id = 4;
@@ -84,7 +82,7 @@ void test_msg_put(struct msg_buff *smsg, __u8 cmd, __u32 minor)
 {
 	struct drbd_genlmsghdr *dhdr;
 
-	dhdr = genlmsg_put(smsg, &drbd_genl_family, 0, cmd);
+	dhdr = genlmsg_put(smsg, legacy_dialect.family, 0, cmd);
 	dhdr->minor = minor;
 	/* set ret_code because this will be directly mapped to a kernel->user message */
 	dhdr->ret_code = NO_ERROR;
@@ -581,23 +579,40 @@ static void test_get_peer_device_sync(struct msg_buff *smsg, struct test_vars *v
  * ################# main() #################
  */
 
-static struct genl_info nlmsghdr_to_genl_info(struct nlmsghdr *nlh, struct nlattr **tla)
+#ifndef WINDRBD
+struct nlmsghdr *drbd2_test_encode(const struct drbd_nl_event *ev, enum drbd_nl_cmd cmd,
+				   struct msg_buff *out);
+#endif
+
+/* Fixtures are legacy messages. With DRBD_NETLINK_FAMILY=drbd2 they are
+ * parsed by the legacy dialect, re-encoded as the drbd2 kernel would send
+ * them, and parsed again by the drbd2 dialect. */
+static void nlmsghdr_to_event(struct nlmsghdr *nlh, enum drbd_nl_cmd cmd, struct drbd_nl_event *ev)
 {
-	int err;
-	struct genl_info info = {
-		.seq = nlh->nlmsg_seq,
-		.nlhdr = nlh,
-		.genlhdr = nlmsg_data(nlh),
-		.userhdr = genlmsg_data(nlmsg_data(nlh)),
-		.attrs = tla,
-	};
-	err = drbd_tla_parse(tla, nlh);
-	if (err) {
-		fprintf(stderr, "drbd_tla_parse() failed");
+	enum drbd_nl_msg r = legacy_dialect.parse_msg(nlh, cmd, ev);
+
+	if (r != NL_MSG_EVENT) {
+		fprintf(stderr, "legacy parse_msg() did not yield an event (%d)\n", r);
 		exit(1);
 	}
+#ifndef WINDRBD
+	if (nl == &drbd2_dialect) {
+		static struct msg_buff *m;
+		struct nlmsghdr *nlh2;
+		unsigned int seq = ev->seq;
 
-	return info;
+		if (!m)
+			m = msg_new(2 * DEFAULT_MSG_SIZE);
+		m->tail = m->data;
+		nlh2 = drbd2_test_encode(ev, cmd, m);
+		nlh2->nlmsg_seq = seq;
+		r = drbd2_dialect.parse_msg(nlh2, cmd, ev);
+		if (r != NL_MSG_EVENT) {
+			fprintf(stderr, "drbd2 parse_msg() did not yield an event (%d)\n", r);
+			exit(1);
+		}
+	}
+#endif
 }
 
 #define TEST_MSG(name) do { \
@@ -730,9 +745,8 @@ int test_events2()
 		struct msg_buff *smsg;
 		struct nlmsghdr *nlh;
 		int err;
-		struct drbd_cmd cm = { };
-		struct nlattr *tla[128];
-		struct genl_info info;
+		struct drbd_cmd cm = { .cmd_id = DRBD_NL_CMD_GET_INITIAL_STATE };
+		struct drbd_nl_event ev;
 
 		err = test_parse_vars(input, msg_name, &vars);
 		if (err)
@@ -756,9 +770,9 @@ int test_events2()
 		nlh->nlmsg_seq = next_msg_seq;
 
 		/* read message as if receiving */
-		info = nlmsghdr_to_genl_info(nlh, tla);
+		nlmsghdr_to_event(nlh, cm.cmd_id, &ev);
 
-		err = print_event(&cm, &info, NULL);
+		err = print_event(&cm, &ev, NULL);
 		if (err) {
 			msg_free(smsg);
 			return err;
@@ -783,19 +797,19 @@ int generic_get_instrumented(const struct drbd_cmd *cm, int timeout_arg, struct 
 	input[strcspn(input, "\n")] = 0;
 
 	switch (cm->cmd_id) {
-		case DRBD_ADM_GET_RESOURCES:
+		case DRBD_NL_CMD_GET_RESOURCES:
 			cmd_id_name = "DRBD_ADM_GET_RESOURCES";
 			break;
-		case DRBD_ADM_GET_DEVICES:
+		case DRBD_NL_CMD_GET_DEVICES:
 			cmd_id_name = "DRBD_ADM_GET_DEVICES";
 			break;
-		case DRBD_ADM_GET_CONNECTIONS:
+		case DRBD_NL_CMD_GET_CONNECTIONS:
 			cmd_id_name = "DRBD_ADM_GET_CONNECTIONS";
 			break;
-		case DRBD_ADM_GET_PEER_DEVICES:
+		case DRBD_NL_CMD_GET_PEER_DEVICES:
 			cmd_id_name = "DRBD_ADM_GET_PEER_DEVICES";
 			break;
-		case DRBD_ADM_GET_INITIAL_STATE:
+		case DRBD_NL_CMD_GET_INITIAL_STATE:
 			cmd_id_name = "DRBD_ADM_GET_INITIAL_STATE";
 			break;
 		default:
@@ -814,9 +828,7 @@ int generic_get_instrumented(const struct drbd_cmd *cm, int timeout_arg, struct 
 		struct test_vars vars = test_init_vars();
 		struct msg_buff *smsg;
 		struct nlmsghdr *nlh;
-		struct drbd_genlmsghdr *dh;
-		struct nlattr *tla[128];
-		struct genl_info info;
+		struct drbd_nl_event ev;
 		int err;
 
 		err = test_parse_vars(input, msg_name, &vars);
@@ -843,19 +855,18 @@ int generic_get_instrumented(const struct drbd_cmd *cm, int timeout_arg, struct 
 		nlh->nlmsg_flags |= NLM_F_MULTI;
 
 		/* read message as if receiving */
-		info = nlmsghdr_to_genl_info(nlh, tla);
+		nlmsghdr_to_event(nlh, cm->cmd_id, &ev);
 
 		/* generic_recv() checks ret_code before invoking the
 		 * handle_reply callback; mirror that, so that the callbacks
 		 * do not need a check of their own. */
-		dh = genlmsg_data(nlmsg_data(nlh));
-		if (dh->ret_code != NO_ERROR &&
-		    !(dh->ret_code == ERR_MINOR_INVALID && cm->missing_ok)) {
-			fprintf(stderr, "ret_code %d\n", dh->ret_code);
+		if (ev.ret_code != NO_ERROR &&
+		    !(ev.ret_code == ERR_MINOR_INVALID && cm->missing_ok)) {
+			fprintf(stderr, "ret_code %d\n", ev.ret_code);
 			return 20;
 		}
 
-		err = cm->handle_reply(cm, &info, rctx);
+		err = cm->handle_reply(cm, &ev, rctx);
 		if (err) {
 			if (err < 0)
 				err = 0;
@@ -948,6 +959,16 @@ int main_generic_instrumented(int argc, char **argv)
  */
 int main(int argc, char **argv)
 {
+	nl = &legacy_dialect;
+#ifndef WINDRBD
+	{
+		const char *family = getenv("DRBD_NETLINK_FAMILY");
+
+		if (family && !strcmp(family, "drbd2"))
+			nl = &drbd2_dialect;
+	}
+#endif
+
 	if (argc < 2) {
 		fprintf(stderr, "USAGE: drbdsetup_instrumented {events2|show} [options]\n");
 		return 1;
