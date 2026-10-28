@@ -3,7 +3,24 @@ Latest:
  For even more detail, use "git log" or visit
  https://github.com/linbit/drbd-utils
 
-9.35.0-rc.1
+Unreleased
+-----------
+ * drbdsetup: use the "drbd2" netlink family when the kernel offers
+   it, fall back to "drbd"; DRBD_NETLINK_FAMILY forces one
+ * drbdsetup,drbdadm: drive a DRBD 9 module that advertises 8.4 over
+   drbd2; use the 8.4 tools only for a genuine DRBD 8.4 module
+ * drbdsetup: hand drbd-8.4 command lines to drbdsetup-84 instead of
+   translating them to DRBD 9 requests
+ * drbdsetup,drbdadm: add the changed block tracking commands
+   cbt-flush, cbt-start, cbt-stop, cbt-status and cbt-dump; suspend-io
+   waits for the last barrier ack, --flush-to-peers=no skips the wait
+ * drbdmeta: keep the changed block tracking bookmark across
+   superblock rewrites, add cbt-dump
+ * libgenl: report the kernel's extended ACK text on netlink errors
+ * spec: enable SELinux on SLES 16+; require bash-completion only
+   conditionally; no rich pacemaker dependency on SLES 12
+
+9.35.0
 -----------
  * drbdadm,adjust: fix ordering to run del-peer after connect;
    avoids quorum-deadlocked resources when swapping a tiebreaker
@@ -41,6 +58,10 @@ Latest:
    /var/lib/linstor.d/
  * drbdmon: major update: selection filters, bulk actions,
    export/import
+ * drbdmon: faster, flicker-free display: only redraw changed
+   screen regions, single write() per update, use the
+   terminal's synchronized output; decode cursor keys in
+   application cursor key mode
  * scripts: add drbd-fence-peer.sh fence-peer handler and
    find-resources-with-unrotated-uuids.sh
  * drbd-verify.py: report which files are affected by
