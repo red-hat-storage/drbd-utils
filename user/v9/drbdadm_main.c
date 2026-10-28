@@ -96,6 +96,8 @@ extern FILE *yyin;
 static int adm_adjust(const struct cfg_ctx *ctx);
 static int adm_new_minor(const struct cfg_ctx *ctx);
 static int adm_resource(const struct cfg_ctx *);
+static int adm_cbt_start(const struct cfg_ctx *);
+static int adm_cbt_dump(const struct cfg_ctx *);
 static int adm_attach(const struct cfg_ctx *);
 static int adm_connect(const struct cfg_ctx *);
 static int adm_new_peer(const struct cfg_ctx *);
@@ -351,6 +353,7 @@ int adm_adjust_wp(const struct cfg_ctx *ctx)
 	.verify_ips = 1,		\
 	.uc_dialog = 1,			\
 	.test_config = 1,		\
+	.no_kernel = 1,			\
 
 #define ACF2_SHELL			\
 	.show_in_usage = 2,		\
@@ -358,6 +361,7 @@ int adm_adjust_wp(const struct cfg_ctx *ctx)
 	.res_name_required = 1,		\
 	.backend_res_name = 1,		\
 	.verify_ips = 0,		\
+	.no_kernel = 1,			\
 
 #define ACF2_SH_RESNAME			\
 	.show_in_usage = 2,		\
@@ -373,6 +377,7 @@ int adm_adjust_wp(const struct cfg_ctx *ctx)
 	.verify_ips = 0,		\
 	.need_peer = 1,			\
 	.is_proxy_cmd = 1,		\
+	.no_kernel = 1,			\
 
 #define ACF2_HOOK			\
 	.show_in_usage = 2,		\
@@ -385,6 +390,7 @@ int adm_adjust_wp(const struct cfg_ctx *ctx)
 	.show_in_usage = 2,		\
 	.res_name_required = 0,		\
 	.verify_ips = 0,		\
+	.no_kernel = 1,			\
 
 /*  */ struct adm_cmd attach_cmd = {"attach", adm_attach, &attach_cmd_ctx, CFG_DISK, ACF1_MINOR_ONLY };
 /*  */ struct adm_cmd disk_options_cmd = {"disk-options", adm_attach, &attach_cmd_ctx, CFG_DISK, ACF1_MINOR_ONLY };
@@ -434,21 +440,21 @@ static struct adm_cmd apply_al_cmd = {"apply-al", adm_drbdmeta, &forceable_ctx, 
 static struct adm_cmd forget_peer_cmd = {"forget-peer", adm_forget_peer, &forceable_ctx, ACF1_DISCONNECT };
 static struct adm_cmd repair_md_cmd = {"repair-md", adm_drbdmeta, &repair_md_ctx, ACF1_MINOR_ONLY };
 
-static struct adm_cmd hidden_cmd = {"hidden-commands", hidden_cmds,.show_in_usage = 1,};
+static struct adm_cmd hidden_cmd = {"hidden-commands", hidden_cmds,.show_in_usage = 1, .no_kernel = 1,};
 
 static struct adm_cmd sh_nop_cmd = {"sh-nop", sh_nop, ACF2_GEN_SHELL .uc_dialog = 1, .test_config = 1};
 static struct adm_cmd sh_resources_cmd = {"sh-resources", sh_resources, ACF2_GEN_SHELL};
-static struct adm_cmd sh_resource_cmd = {"sh-resource", sh_resource, ACF2_SH_RESNAME .vol_id_optional = 1};
+static struct adm_cmd sh_resource_cmd = {"sh-resource", sh_resource, ACF2_SH_RESNAME .vol_id_optional = 1, .no_kernel = 1};
 static struct adm_cmd sh_mod_parms_cmd = {"sh-mod-parms", sh_mod_parms, ACF2_GEN_SHELL};
 static struct adm_cmd sh_dev_cmd = {"sh-dev", sh_dev, ACF2_SHELL};
-static struct adm_cmd sh_udev_cmd = {"sh-udev", sh_udev, .vol_id_required = 1, ACF2_HOOK};
+static struct adm_cmd sh_udev_cmd = {"sh-udev", sh_udev, .vol_id_required = 1, ACF2_HOOK .no_kernel = 1};
 static struct adm_cmd sh_minor_cmd = {"sh-minor", sh_minor, ACF2_SHELL};
 static struct adm_cmd sh_ll_dev_cmd = {"sh-ll-dev", sh_ll_dev, ACF2_SHELL .disk_required = 0};
 static struct adm_cmd sh_md_dev_cmd = {"sh-md-dev", sh_md_dev, ACF2_SHELL .disk_required = 1};
 static struct adm_cmd sh_md_idx_cmd = {"sh-md-idx", sh_md_idx, ACF2_SHELL .disk_required = 1};
 static struct adm_cmd sh_ip_cmd = {"sh-ip", sh_ip, ACF2_SHELL .need_peer = 1, .iterate_paths = 1};
 static struct adm_cmd sh_lr_of_cmd = {"sh-lr-of", sh_lres, ACF2_SHELL};
-static struct adm_cmd sh_lcf_cmd = {"sh-list-config-file", sh_lcf, ACF2_SH_RESNAME .vol_id_optional = 1};
+static struct adm_cmd sh_lcf_cmd = {"sh-list-config-file", sh_lcf, ACF2_SH_RESNAME .vol_id_optional = 1, .no_kernel = 1};
 
 static struct adm_cmd proxy_up_cmd = {"proxy-up", adm_proxy_up, ACF2_PROXY};
 static struct adm_cmd proxy_down_cmd = {"proxy-down", adm_proxy_down, ACF2_PROXY};
@@ -475,6 +481,11 @@ static struct adm_cmd khelper14_cmd = {"disconnected", adm_khelper, ACF3_RES_HAN
 
 static struct adm_cmd suspend_io_cmd = {"suspend-io", adm_drbdsetup, &suspend_io_ctx, ACF4_ADVANCED  .backend_res_name = 0 };
 static struct adm_cmd resume_io_cmd = {"resume-io", adm_drbdsetup, ACF4_ADVANCED  .backend_res_name = 0 };
+static struct adm_cmd cbt_flush_cmd = {"cbt-flush", adm_drbdsetup, ACF4_ADVANCED_NEED_VOL .backend_res_name = 0};
+static struct adm_cmd cbt_start_cmd = {"cbt-start", adm_cbt_start, &cbt_start_adm_ctx, ACF4_ADVANCED_NEED_VOL .backend_res_name = 0};
+static struct adm_cmd cbt_stop_cmd = {"cbt-stop", adm_drbdsetup, ACF4_ADVANCED_NEED_VOL .backend_res_name = 0};
+static struct adm_cmd cbt_status_cmd = {"cbt-status", adm_drbdsetup, ACF4_ADVANCED_NEED_VOL .backend_res_name = 0};
+static struct adm_cmd cbt_dump_cmd = {"cbt-dump", adm_cbt_dump, &cbt_dump_adm_ctx, ACF4_ADVANCED_NEED_VOL .disk_required = 1};
 static struct adm_cmd set_gi_cmd = {"set-gi", adm_drbdmeta, &wildcard_ctx, .disk_required = 1, .need_peer = 1, ACF4_ADVANCED_NEED_VOL};
 static struct adm_cmd new_current_uuid_cmd = {"new-current-uuid", adm_drbdsetup, &new_current_uuid_cmd_ctx, ACF4_ADVANCED_NEED_VOL .backend_res_name = 0};
 static struct adm_cmd check_resize_cmd = {"check-resize", adm_chk_resize, ACF4_ADVANCED};
@@ -575,6 +586,11 @@ struct adm_cmd *cmds[] = {
 
 	&suspend_io_cmd,
 	&resume_io_cmd,
+	&cbt_flush_cmd,
+	&cbt_start_cmd,
+	&cbt_stop_cmd,
+	&cbt_status_cmd,
+	&cbt_dump_cmd,
 	&set_gi_cmd,
 	&new_current_uuid_cmd,
 	&check_resize_cmd,
@@ -1678,6 +1694,66 @@ int _adm_drbdmeta(const struct cfg_ctx *ctx, int flags, char *argument)
 static int adm_drbdmeta(const struct cfg_ctx *ctx)
 {
 	return _adm_drbdmeta(ctx, SLEEPS_VERY_LONG, NULL);
+}
+
+/* The value of a "--name=value" option of the command line, or NULL. */
+static const char *backend_option_value(const char *name_eq)
+{
+	struct d_name *opt = find_backend_option(name_eq);
+
+	return opt ? opt->name + strlen(name_eq) : NULL;
+}
+
+static int adm_cbt_start(const struct cfg_ctx *ctx)
+{
+	const char *id = backend_option_value("--id=");
+	const char *argv[MAX_ARGS];
+	int argc = 0;
+
+	if (!id) {
+		fprintf(stderr, "%s: cbt-start needs --id={bookmark id}\n", ctx->res->name);
+		return 20;
+	}
+	argv[NA(argc)] = drbdsetup;
+	argv[NA(argc)] = ctx->cmd->name;
+	argv[NA(argc)] = ssprintf("%d", ctx->vol->device_minor);
+	argv[NA(argc)] = id;
+	argv[NA(argc)] = 0;
+
+	return m_system_ex(argv, SLEEPS_SHORT, ctx->res->name);
+}
+
+/* drbdmeta cbt-dump on the snapshot of the meta data of this volume */
+static int adm_cbt_dump(const struct cfg_ctx *ctx)
+{
+	const char *md_snapshot = backend_option_value("--md-snapshot=");
+	struct d_volume *vol = ctx->vol;
+	const char *argv[MAX_ARGS];
+	struct d_name *opt;
+	int argc = 0;
+
+	if (!md_snapshot) {
+		fprintf(stderr, "%s: cbt-dump needs --md-snapshot={device}\n", ctx->res->name);
+		return 20;
+	}
+	argv[NA(argc)] = drbdmeta;
+	argv[NA(argc)] = "-";
+	argv[NA(argc)] = "v09";
+	argv[NA(argc)] = md_snapshot;
+	if (!strcmp(vol->meta_index, "flexible"))
+		argv[NA(argc)] = strcmp(vol->meta_disk, "internal") ? "flex-external" : "flex-internal";
+	else
+		argv[NA(argc)] = vol->meta_index;
+	argv[NA(argc)] = ctx->cmd->name;
+	opt = find_backend_option("--start-offset=");
+	if (opt)
+		argv[NA(argc)] = opt->name;
+	opt = find_backend_option("--max-extents=");
+	if (opt)
+		argv[NA(argc)] = opt->name;
+	argv[NA(argc)] = 0;
+
+	return m_system_ex(argv, SLEEPS_LONG, ctx->res->name);
 }
 
 static void __adm_drbdsetup(const struct cfg_ctx *ctx, int flags, pid_t *pid, int *fd, int *ex)
@@ -3598,6 +3674,97 @@ struct adm_cmd *find_cmd(char *cmdname)
 	return cmd;
 }
 
+/*
+ * The command on the command line, found before parse_options() runs:
+ * the first word that names one. Unlike find_cmd(), no side effects.
+ * NULL for commands only drbdadm-84 knows.
+ */
+static const struct adm_cmd *peek_cmd(int argc, char **argv)
+{
+	unsigned int i;
+	int a;
+
+	for (a = 1; a < argc; a++) {
+		if (argv[a][0] == '-')
+			continue;
+		for (i = 0; i < ARRAY_SIZE(cmds); i++)
+			if (!strcmp(cmds[i]->name, argv[a]))
+				return cmds[i];
+	}
+	return NULL;
+}
+
+static bool short_opt_takes_arg(char c)
+{
+	const struct option *opt;
+
+	for (opt = general_admopt; opt->name; opt++)
+		if (opt->val == c)
+			return opt->has_arg != no_argument;
+	return false;
+}
+
+/*
+ * Whether -d/--dry-run is on the command line, found before parse_options()
+ * runs: also within a group of short options, up to one that takes an
+ * argument, and as an abbreviation of --dry-run that getopt_long() accepts.
+ */
+static bool peek_dry_run(int argc, char **argv)
+{
+	const char *arg, *c;
+	int a;
+
+	for (a = 1; a < argc; a++) {
+		arg = argv[a];
+		if (!strcmp(arg, "--"))
+			break;
+		if (arg[0] != '-')
+			continue;
+		if (arg[1] == '-') {
+			/* "--dr" could also be --drbdsetup, --drbdmeta, ... */
+			if (strlen(arg) >= strlen("--dry") &&
+			    !strncmp(arg, "--dry-run", strlen(arg)))
+				return true;
+			continue;
+		}
+		for (c = arg + 1; *c; c++) {
+			if (*c == 'd')
+				return true;
+			if (short_opt_takes_arg(*c))
+				break; /* the rest is its argument */
+		}
+	}
+	return false;
+}
+
+/*
+ * Whether drbdadm-84 drives the kernel: a genuine DRBD 8.4 only, as
+ * drbd_driver_needs_84_tools() reads it from /proc/drbd. Never ask the
+ * kernel over netlink here: drbdadm is the usermode helper, and an 8.4
+ * module holds the genl_lock while it runs one.
+ *
+ * Without /proc/drbd, the version comes from modinfo, which also says 8.4
+ * for a DRBD 9 module that serves "drbd" at version 1 next to drbd2. Load
+ * the module then and read /proc/drbd, unless the command never talks to
+ * the kernel, is one only drbdadm-84 knows, or this is a dry run. Otherwise
+ * the first "drbdadm up" after boot would go by modinfo's version.
+ */
+static bool use_drbdadm_84(int argc, char **argv)
+{
+	const struct adm_cmd *cmd;
+
+	if (!drbd_driver_needs_84_tools(driver_version))
+		return false;
+
+	cmd = peek_cmd(argc, argv);
+	if (!getenv("DRBD_DRIVER_VERSION_OVERRIDE") &&
+	    cmd && !cmd->no_kernel && !peek_dry_run(argc, argv) &&
+	    load_drbd_module())
+		driver_version = get_drbd_driver_version();
+
+	return drbd_driver_needs_84_tools(driver_version);
+}
+
 char *config_file_from_arg(char *arg)
 {
 	char *f;
@@ -3736,8 +3903,7 @@ int main(int argc, char **argv)
 		exit(E_EXEC_ERROR);
 	}
 
-	if (driver_version &&
-	    driver_version->version.major == 8 && driver_version->version.minor == 4)
+	if (use_drbdadm_84(argc, argv))
 		exec_legacy_drbdadm(argv);
 
 	recognize_all_drbdsetup_options();
