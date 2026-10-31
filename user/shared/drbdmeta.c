@@ -5573,6 +5573,13 @@ void md_convert_08_to_09(struct format *cfg)
 
 	cfg->md.flags &= ~(MDF_CONNECTED_IND | MDF_FULL_SYNC | MDF_PEER_OUT_DATED);
 
+	/* DRBD 8.4 recognizes a crashed primary by MDF_PRIMARY_IND when it
+	 * attaches; DRBD 9 only by MDF_CRASHED_PRIMARY, which it writes while
+	 * primary.  Without it, DRBD 9 does not resync the activity log
+	 * extents of the crash window. */
+	if (cfg->md.flags & MDF_PRIMARY_IND)
+		cfg->md.flags |= MDF_CRASHED_PRIMARY;
+
 	cfg->md.node_id = -1;
 	cfg->md.magic = DRBD_MD_MAGIC_09;
 	/* The peer entries above are ours, so the flags in them are current. */

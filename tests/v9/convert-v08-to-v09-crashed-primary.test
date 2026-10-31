@@ -1,0 +1,24 @@
+## Test that the v08 -> v09 conversion keeps a crashed primary.
+##
+## DRBD 8.4 marks a running primary only with MDF_PRIMARY_IND.  DRBD 9
+## recognizes a crashed primary only by MDF_CRASHED_PRIMARY, and without it
+## does not resync the activity log extents of the crash window.
+##
+## Test layout: 256 MB image, flex-internal v08 meta data with the flags of a
+## primary that crashed: 0x3 is MDF_CONSISTENT | MDF_PRIMARY_IND, MDF_AL_CLEAN
+## is not set.  After the conversion MDF_CRASHED_PRIMARY (0x40) is set as well.
+$ tmpdir=$(mktemp -d) && img=$(mktemp --suffix=.img)
+$ truncate -s 268435456 "$img"
+$ drbdmeta --force --var-lib-drbd "$tmpdir" - v08 "$img" flex-internal create-md 2>/dev/null | tail -1
+New drbd meta data block successfully created.
+$ drbdmeta --force - v08 "$img" flex-internal dump-md 2>/dev/null > "$tmpdir/dump.txt"
+$ awk '/^uuid \{/{u=1} u && /^    flags/{sub(/0x00000080/, "0x00000003")} /^\}/{u=0} {print}' "$tmpdir/dump.txt" > "$tmpdir/v08.txt"
+$ drbdmeta --force --var-lib-drbd "$tmpdir" - v08 "$img" flex-internal restore-md "$tmpdir/v08.txt" 2>/dev/null | tail -1
+Successfully restored meta data
+$ drbdmeta --force - v08 "$img" flex-internal dump-md 2>/dev/null | grep '^    flags'
+    flags 0x00000003;
+$ drbdmeta --force --var-lib-drbd "$tmpdir" - v09 "$img" flex-internal create-md 1 2>/dev/null | tail -1
+New drbd meta data block successfully created.
+$ drbdmeta --force - v09 "$img" flex-internal dump-md 2>/dev/null | grep '^flags'
+flags 0x00000043;
+$ rm -rf "$tmpdir" "$img"
