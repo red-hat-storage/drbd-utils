@@ -16,7 +16,7 @@ RUN yum -y update-minimal --security --sec-severity=Important --sec-severity=Cri
 RUN groupadd makepkg # !lbbuild
 RUN useradd -m -g makepkg makepkg # !lbbuild
 
-RUN yum install -y rpm-build wget gcc flex glibc-devel make automake systemd-udev && yum clean all -y # !lbbuild
+RUN yum install -y rpm-build wget gcc flex glibc-devel make automake systemd-udev git checkpolicy selinux-policy-devel keyutils-libs-devel libxslt && yum clean all -y # !lbbuild
 
 RUN cd /tmp && . "$NV" && wget "$DRBD_UTILS_DL_TGZ" # !lbbuild
 # =lbbuild COPY /${DRBD_UTILS_TGZ} /tmp/
