@@ -5,6 +5,33 @@ Latest:
 
 Unreleased
 -----------
+
+9.36.0
+-----------
+ * drbdadm: raise the default cmd-timeout-short from 5 to 10 seconds;
+   keep the medium and long defaults that were in effect (600, none)
+ * drbdadm: show changed cmd-timeout-* settings in the v9 dump
+ * drbdadm: fix adjust failing silently when a wait-connect lasted
+   longer than the remaining cmd-timeout of the preceding connect
+ * drbdmeta: keep the bitmap provenance feature of DRBD 9.2.20 and 9.3.4
+   when writing the superblock; apply-al after a crash cleared it, and
+   DRBD then counted a crashed Secondary's activity log bits as set for
+   blocks its peers lack
+ * drbdmeta: forget-peer makes the freed bitmap slot a day0 slot, a
+   copy of one or all bits set, as the kernel does
+ * drbdmeta: cbt-dump --mode=dirty|zero also reports the extents never
+   written since create-md, from the day0 bitmap; "format": 1; the
+   extents are start and length and cover the volume, as in ovirt-imageio
+ * drbdmeta: cbt-dump on a dm-thin volume takes the zero extents from
+   the mappings of the thin pool, which, unlike the day0 bitmap, know
+   about discards; with external meta data, --data-device (drbdadm:
+   --data-snapshot) names the snapshot of the backing device
+ * drbdmeta: fix apply-al skipping the last activity log extent of the
+   device as beyond the end of the bitmap, so that extent was not
+   resynced after a crash of the Primary; since 9.33.0
+ * drbdmeta: apply-al reports the amount it marked out of sync
+   correctly; it reported 0 KB with up to 128 KB per bitmap bit, and
+   counted bits past the end of the device
  * drbdsetup: use the "drbd2" netlink family when the kernel offers
    it, fall back to "drbd"; DRBD_NETLINK_FAMILY forces one
  * drbdsetup,drbdadm: drive a DRBD 9 module that advertises 8.4 over
@@ -20,7 +47,11 @@ Unreleased
    it a crashed primary, so DRBD 9 resyncs its activity log extents
  * drbdadm,adjust: fix a recreated proxied peer stuck in Connecting;
    rebuild its proxy connection when a peer or path is new
+ * drbdadm: fix require-drbd-module-version-{lt,le,gt,ge}; for example,
+   requiring 9.2.0 or later accepted a 9.1.0 or 8.4.11 module
  * libgenl: report the kernel's extended ACK text on netlink errors
+ * drbdsetup: add attach --discard-my-data to resolve a split brain
+   detected when attaching to a connected device
  * spec: enable SELinux on SLES 16+; require bash-completion only
    conditionally; no rich pacemaker dependency on SLES 12
 

@@ -338,6 +338,26 @@ static void test_extack_message(void)
 	msg_free(m);
 }
 
+static void test_extack_offset(void)
+{
+	struct msg_buff *m;
+	struct nlmsghdr *nlh;
+	__u32 offs = 0;
+
+	m = msg_new(DEFAULT_MSG_SIZE);
+	nlh = build_error_reply(m, -EINVAL, false, "Unknown attribute type");
+	nla_put_u32(m, NLMSGERR_ATTR_OFFS, 52);
+	nlh->nlmsg_len = m->tail - (unsigned char *)nlh;
+	CHECK(nlmsg_extack_offs(nlh, &offs));
+	CHECK(offs == 52);
+	msg_free(m);
+
+	m = msg_new(DEFAULT_MSG_SIZE);
+	nlh = build_error_reply(m, -EINVAL, true, "no offset");
+	CHECK(!nlmsg_extack_offs(nlh, &offs));
+	msg_free(m);
+}
+
 /* The legacy family also gets extended ACKs from a modern kernel; the
  * text beats strerror(). A positive ACK is not an error. */
 static void test_legacy_outcome_keeps_extack_text(void)
@@ -383,6 +403,7 @@ static const struct { enum drbd_nl_attr_set set; int legacy_id; } drbd2_flag_fie
 	{ NL_SET_RESIZE_PARMS, DRBD_A_RESIZE_PARMS_RESIZE_FORCE },
 	{ NL_SET_RESIZE_PARMS, DRBD_A_RESIZE_PARMS_NO_RESYNC },
 	{ NL_SET_DISCONNECT_PARMS, DRBD_A_DISCONNECT_PARMS_FORCE_DISCONNECT },
+	{ NL_SET_ATTACH_PARMS, DRBD_A_ATTACH_PARMS_ATTACH_DISCARD_MY_DATA },
 };
 
 static bool is_drbd2_flag_field(enum drbd_nl_attr_set set, int legacy_id)
@@ -457,6 +478,8 @@ static void test_drbd2_attr_maps_complete(void)
 	CHECK_SET(NL_SET_CONNECT_PARMS, connect_parms);
 	CHECK_SET(NL_SET_RENAME_RESOURCE_PARMS, rename_resource_parms);
 	CHECK_SET(NL_SET_SUSPEND_IO_PARMS, suspend_io_parms);
+	CHECK_SET(NL_SET_CBT_START_PARMS, cbt_start_parms);
+	CHECK_SET(NL_SET_ATTACH_PARMS, attach_parms);
 #undef CHECK_SET
 	/* carried by the context nest in drbd2 */
 	CHECK(drbd2_dialect.nest_start(NULL, NL_SET_PATH_PARMS) == NULL);
@@ -791,7 +814,14 @@ static void test_genl_connect_to_family_unregistered(void)
 	/* GENL_NAMSIZ (16, including the terminating NUL) caps how long this
 	 * name can be. */
 	struct genl_family family = { .name = "no-such-family" };
-	struct genl_sock *s = genl_connect_to_family(&family, NULL);
+	/* Below the kernel's default net.core.{r,w}mem_max: with the 1 MiB
+	 * defaults, libgenl warns on stderr on a host that does not raise
+	 * them, and the output comparison of the test fails. */
+	struct genl_connect_options opts = {
+		.rcvbuf_size = 64 << 10,
+		.sndbuf_size = 64 << 10,
+	};
+	struct genl_sock *s = genl_connect_to_family(&family, &opts);
 
 	CHECK(!s || !s->s_family);
 	if (s) {
@@ -922,6 +952,7 @@ int main(int argc, char **argv)
 	test_legacy_parse_device_change();
 	test_legacy_parse_skips_without_identity();
 	test_extack_message();
+	test_extack_offset();
 	test_legacy_outcome_keeps_extack_text();
 #ifndef WINDRBD
 	test_drbd2_attr_maps_complete();

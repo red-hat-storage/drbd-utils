@@ -98,6 +98,14 @@ bool option_peers_outdated = false;
 bool option_rotate_uuids = false;
 uint64_t option_start_offset = 0;
 uint64_t option_max_extents = 0;
+enum cbt_dump_mode {
+	CBT_DUMP_MODE_DIRTY,
+	CBT_DUMP_MODE_ZERO,
+} option_cbt_dump_mode = CBT_DUMP_MODE_DIRTY;
+/* thin_dump output to take the zero extents from, for the tests */
+const char *option_thin_dump;
+/* the data of the volume, for the zero extents of a dm-thin volume */
+const char *option_data_device;
 
 static uint64_t generate_random_uuid(void)
 {
@@ -154,6 +162,9 @@ enum metaopt_long_only {
 	OPT_MAX_PEERS,
 	OPT_START_OFFSET,
 	OPT_MAX_EXTENTS,
+	OPT_MODE,
+	OPT_THIN_DUMP,
+	OPT_DATA_DEVICE,
 };
 
 struct option metaopt[] = {
@@ -183,6 +194,9 @@ struct option metaopt[] = {
     { "max-peers", required_argument, NULL, OPT_MAX_PEERS },
     { "start-offset", required_argument, NULL, OPT_START_OFFSET },
     { "max-extents", required_argument, NULL, OPT_MAX_EXTENTS },
+    { "mode", required_argument, NULL, OPT_MODE },
+    { "thin-dump", required_argument, NULL, OPT_THIN_DUMP },
+    { "data-device", required_argument, NULL, OPT_DATA_DEVICE },
     { NULL,     0,              0, 0 },
 };
 
@@ -313,7 +327,8 @@ bool confirmed(const char *text)
 /* Meta data features which drbdmeta maintains correctly. Its own counterpart
  * of the DRBD module's DRBD_MD_FEATURES.
  */
-#define DRBD_MD_FEATURES (DRBD_MDFF_DIVERGENCE_BITMAP | DRBD_MDFF_CBT)
+#define DRBD_MD_FEATURES (DRBD_MDFF_DIVERGENCE_BITMAP | DRBD_MDFF_BITMAP_AUTHORITATIVE | \
+			  DRBD_MDFF_CBT)
 
 /*
  * }
@@ -981,8 +996,10 @@ struct meta_cmd cmds[] = {
 	{"show-gi", 0, meta_show_gi, 1, 1, 0},
 	{"dump-md", 0, meta_dump_md, 1, 0, 0},
 	{"cbt-dump",
+		"[--mode={dirty,zero}] "
 		"[--start-offset {val}] "
-		"[--max-extents {val}]",
+		"[--max-extents {val}] "
+		"[--data-device {device}]",
 		meta_cbt_dump, 1, 0, 0},
 	{"dump-superblock",
 		"[--output-format={binary,hex,json}]",
@@ -1019,6 +1036,12 @@ struct meta_cmd cmds[] = {
 		"[--bitmap-block-size {val}] "
 		"[--peers {val}] "
 		"[--bitmap-slots {val}] "
+		"[--initialize-bitmap={automatic,zeroout,pwrite,set-all,skip}] "
+		"[--initial-current-uuid={generate,val}] "
+		"[--consistent] "
+		"[--uptodate] "
+		"[--peers-outdated] "
+		"[--rotate-uuids] "
 		"{max_peers}",
 		meta_create_md, 1, 0, 1},
 	{"forget-peer", 0, meta_forget_peer, 1, 1, 1},
@@ -1300,6 +1323,7 @@ void m_set_v9_uuid(struct md_cpu *md, int node_id, char **argv, int argc __attri
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_FULL_SYNC)) break;
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_DEVICE_SEEN)) break;
 		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_DIVERGENCE_BITMAP)) break;
+		if (!m_strsep_bit(str, &md->peers[node_id].flags, MDF_PEER_BITMAP_AUTHORITATIVE)) break;
 	} while (0);
 }
 
@@ -2383,18 +2407,10 @@ static int ilog2(unsigned long word)
  * Our bitmap granularity is a power of two multiple of 4k,
  * 4k to 1M, [4, 8, 16, 32, 64, 128, 256, 512, 1024]k.
  *
- * As long as our bitmap granularity is <= 128k,
- * we can set multiples of 32bit, which makes this much easier:
- * we could just calculate the byte offset and length,
- * multiply with max_peers, then memset().
- *
- * At 4k, we set 128 bytes * max_peers for each extent.
- * At 128k, we set 4 bytes * max_peers for each extent.
- *
- * For 256k and above, we only set partial 32bit words.
- * Now we have to calculate a 32bit mask,
- * and apply it to max_peers 32bit words.
- *
+ * apply_al() sets the bits of an extent one 32bit word at a time:
+ * it calculates a 32bit mask and applies it to the max_peers words.
+ * At 4k an extent covers 32 full words per slot, at 128k one full word,
+ * and for 256k and above a part of one word.
  */
 
 struct extent_bit_range {
@@ -2419,16 +2435,30 @@ static size_t round_down(size_t i, size_t  g)
 }
 
 static void enr_to_bit_range(struct extent_bit_range *br, const uint64_t enr,
-		const size_t bits_per_extent, const unsigned int max_peers)
+		const size_t bits_per_extent, const unsigned int max_peers,
+		const size_t bm_bytes)
 {
 	br->bit_s = enr * bits_per_extent;
 	br->bit_e = br->bit_s + bits_per_extent;
 
 	br->on_disk_word32_pos_s = br->bit_s / 32 * max_peers * 4;
 	br->on_disk_word32_pos_e = (br->bit_e  + 31)/ 32 * max_peers * 4;
+	/* The last extent may end past the bitmap; that part holds only surplus bits. */
+	if (br->on_disk_word32_pos_e > bm_bytes)
+		br->on_disk_word32_pos_e = bm_bytes;
 
 	br->aligned_4k_x_max_peers_on_disk_pos =
 		round_down(br->on_disk_word32_pos_s, 4096 * max_peers);
+}
+
+/* Mask of the bits of the 32 bit word starting at bit that lie on the device. */
+static uint32_t in_range_mask(uint64_t bit, uint64_t bm_bits)
+{
+	if (bit >= bm_bits)
+		return 0;
+	if (bm_bits - bit >= 32)
+		return ~(uint32_t)0;
+	return ~(uint32_t)0 >> (32 - (bm_bits - bit));
 }
 
 void apply_al(struct format *cfg, uint32_t *hot_extent)
@@ -2439,29 +2469,30 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 	size_t chunk = 0;
 	int i, j, k;
 
-	/* can only be AL_EXTENTS_MAX * BM_BYTES_PER_AL_EXT * 8,
-	 * which currently is 65534 * 128 * 8 == 67106816
-	 * fits easily into 32bit. */
+	/* at most AL_EXTENTS_MAX * 1024 bits * DRBD_PEERS_MAX slots,
+	 * 65534 * 1024 * 32 == 2147418112, fits into 32bit. */
 	unsigned additional_bits_set = 0;
 	char ppb[10];
 
 	/* how may bits will be affected by applying one extent */
 	size_t bits_per_extent = 1UL << (AL_EXTENT_SHIFT - ilog2(cfg->md.bm_bytes_per_bit));
 	unsigned int max_peers = cfg->md.max_peers;
+	const uint64_t bm_bits = (cfg->md.effective_size + (cfg->md.bm_bytes_per_bit >> 9) - 1)
+		/ (cfg->md.bm_bytes_per_bit >> 9);
 
 	ASSERT_MSG(4 <= bits_per_extent && bits_per_extent <= 1024 && is_power_of_2(bits_per_extent),
 		" bits_per_extent: %zd", bits_per_extent);
 	ASSERT_MSG(1 <= max_peers && max_peers <= DRBD_PEERS_MAX, " max_peers: %u", max_peers);
 
 	/* Now, actually apply this stuff to the on-disk bitmap.
-	 * Since one AL extent corresponds to 128 bytes of bitmap,
-	 * we need to do some read/modify/write cycles here.
+	 * One AL extent covers at most 128 bytes of bitmap per slot,
+	 * so we need to do some read/modify/write cycles here.
 	 *
 	 * Note that this can be slow due to the use of O_DIRECT,
 	 * worst case it does 65534 (AL_EXTENTS_MAX) cycles of
-	 *  - read buffer_size
-	 *  - set a few bits (equivalent to one activity log extent),
-	 *  - write buffer size
+	 *  - read up to buffer_size
+	 *  - set the bits of one activity log extent
+	 *  - write it back
 	 * This implementation could optimized in various ways:
 	 *  - don't use direct IO; has other drawbacks
 	 *  - use aio with multiple buffers
@@ -2469,7 +2500,6 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 	 */
 	for (i = 0; i < AL_EXTENTS_MAX; i++) {
 		struct extent_bit_range first_ex, last_ex, tmp_ex;
-		unsigned bits_set = 0;
 
 
 		/* hot_extent is sorted.
@@ -2479,7 +2509,7 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 			break;
 
 		/* find range of hot extents we can cover with one "buffer_size" bitmap IO */
-		enr_to_bit_range(&first_ex, hot_extent[i], bits_per_extent, max_peers);
+		enr_to_bit_range(&first_ex, hot_extent[i], bits_per_extent, max_peers, bm_bytes);
 		if (verbose >= 3)
 			fprintf(stderr, "apply-al: %4d: %5d: [%zd..[%zd; [%zd..[%zd; %zd; peers %d; bits pe: %zd; bm_bytes: %zd\n",
 				i, hot_extent[i],
@@ -2490,9 +2520,9 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 				first_ex.aligned_4k_x_max_peers_on_disk_pos,
 				max_peers, bits_per_extent, bm_bytes);
 
-		if (first_ex.on_disk_word32_pos_e >= bm_bytes) {
+		if (first_ex.on_disk_word32_pos_s >= bm_bytes) {
 			fprintf(stderr, "extent %u beyond end of bitmap! (%zd >= %zd)\n",
-				hot_extent[i], first_ex.on_disk_word32_pos_e, bm_bytes);
+				hot_extent[i], first_ex.on_disk_word32_pos_s, bm_bytes);
 			/* They are sorted. It won't get better.
 			 * Could break or return error here,
 			 * but I'll just print a warning, and skip, each of them. */
@@ -2500,7 +2530,7 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 		}
 
 		for (j = i; j + 1 < AL_EXTENTS_MAX && hot_extent[j+1] != ~0U; j++) {
-			enr_to_bit_range(&tmp_ex, hot_extent[j+1], bits_per_extent, max_peers);
+			enr_to_bit_range(&tmp_ex, hot_extent[j+1], bits_per_extent, max_peers, bm_bytes);
 			if (verbose >= 3)
 				fprintf(stderr, "       ?: %4d: %5d: [%zd..[%zd; [%zd..[%zd; %zd; peers %d; bits pe: %zd; bm_bytes: %zd\n",
 					j+1, hot_extent[j+1],
@@ -2510,15 +2540,13 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 					tmp_ex.on_disk_word32_pos_e,
 					tmp_ex.aligned_4k_x_max_peers_on_disk_pos,
 					max_peers, bits_per_extent, bm_bytes);
-			if (tmp_ex.on_disk_word32_pos_e >= bm_bytes) {
-				fprintf(stderr, "extent %u beyond end of bitmap! (%zd >= %zd)\n",
-					hot_extent[j+1], tmp_ex.on_disk_word32_pos_e, bm_bytes);
+			/* the outer loop reports and skips it */
+			if (tmp_ex.on_disk_word32_pos_s >= bm_bytes)
 				break;
-			}
 			if (tmp_ex.on_disk_word32_pos_e >= first_ex.aligned_4k_x_max_peers_on_disk_pos + buffer_size)
 				break;
 		}
-		enr_to_bit_range(&last_ex, hot_extent[j], bits_per_extent, max_peers);
+		enr_to_bit_range(&last_ex, hot_extent[j], bits_per_extent, max_peers, bm_bytes);
 
 		/* aligning end of buffer to 4k is good enough. */
 		chunk =   ALIGN(last_ex.on_disk_word32_pos_e, 4096)
@@ -2526,58 +2554,35 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 
 		/* read the bitmap for this range */
 		bm_on_disk_pos = first_ex.aligned_4k_x_max_peers_on_disk_pos;
-		ASSERT(chunk <= buffer_size)
+		ASSERT(chunk <= buffer_size);
 		pread_or_die(cfg, on_disk_buffer, chunk, bm_on_disk_off + bm_on_disk_pos, "apply_al read bitmap chunk");
 
 		/* change the bits */
 		for (k = i; k <= j; k++) {
-			enr_to_bit_range(&tmp_ex, hot_extent[k], bits_per_extent, max_peers);
+			enr_to_bit_range(&tmp_ex, hot_extent[k], bits_per_extent, max_peers, bm_bytes);
 
 			ASSERT(tmp_ex.on_disk_word32_pos_s - bm_on_disk_pos < chunk);
 			ASSERT(tmp_ex.on_disk_word32_pos_e - bm_on_disk_pos <= chunk);
 
-			if (bits_per_extent >= 32) {
-				size_t num_bytes = tmp_ex.on_disk_word32_pos_e - tmp_ex.on_disk_word32_pos_s;
+			if (verbose >= 3)
+				fprintf(stderr, "       !: %4d: %5d: (char*)bm+[%zd..[%zd\n",
+					k, hot_extent[k],
+					tmp_ex.on_disk_word32_pos_s, tmp_ex.on_disk_word32_pos_e);
 
-				if (verbose >= 3)
-					fprintf(stderr, "       !: %4d: %5d: memset(((char*)bm)+%zd, 0xff, %zd)\n",
-						k, hot_extent[k], tmp_ex.on_disk_word32_pos_s, num_bytes);
+			uint32_t *word32 = (uint32_t *)((char *)on_disk_buffer +
+					(tmp_ex.on_disk_word32_pos_s - bm_on_disk_pos));
+			size_t pos;
 
-				/* we set full words, endianness does not make a difference */
-				memset((char*)on_disk_buffer + (tmp_ex.on_disk_word32_pos_s - bm_on_disk_pos),
-					0xff, num_bytes);
-				continue;
-			}
+			for (pos = tmp_ex.on_disk_word32_pos_s; pos < tmp_ex.on_disk_word32_pos_e; pos += 4, word32++) {
+				const uint64_t word_bit = pos / 4 / max_peers * 32;
+				const unsigned lo = tmp_ex.bit_s > word_bit ? tmp_ex.bit_s - word_bit : 0;
+				const unsigned hi = tmp_ex.bit_e < word_bit + 32 ? tmp_ex.bit_e - word_bit : 32;
+				/* The buffer is little endian; hweight and |= do not care. */
+				const uint32_t mask = cpu_to_le32(~(uint32_t)0 >> (32 - (hi - lo)) << lo);
+				const uint32_t in_range = cpu_to_le32(in_range_mask(word_bit, bm_bits));
 
-			/* only 16, 8, or 4 bits to be set,
-			 * once for each 32bit word of each slot */
-
-			uint32_t *word32;
-			uint32_t mask;
-			int l;
-
-			word32 = (uint32_t*)on_disk_buffer;
-			word32 += (tmp_ex.on_disk_word32_pos_s - bm_on_disk_pos)/sizeof(*word32);
-
-			mask = ~(uint32_t)0 << (tmp_ex.bit_s & 31);
-			mask &= ~(uint32_t)0 >> ((32 - (tmp_ex.bit_e & 31)) & 31);
-
-			/* On disk buffer is is little endian.
-			 * *word32 = cpu_to_le32(le32_to_cpu(*word32)|mask) is equivalent to
-			 * *word32 |= cpu_to_le32(mask).
-			 */
-			mask = cpu_to_le32(mask);
-
-			for (l = 0; l < max_peers; l++) {
-				if (verbose >= 3)
-					fprintf(stderr, "       !: %4d: %5d: (uint32_t*)bm+%zd |= %08x\n",
-						k, hot_extent[k],
-						word32 - (uint32_t*)on_disk_buffer,
-						mask);
-				bits_set = generic_hweight32(*word32);
+				additional_bits_set += generic_hweight32(mask & in_range & ~*word32);
 				*word32 |= mask;
-				additional_bits_set += generic_hweight32(*word32) - bits_set;
-				++word32;
 			}
 		}
 
@@ -2587,7 +2592,7 @@ void apply_al(struct format *cfg, uint32_t *hot_extent)
 	}
 	if (i != 0) {
 		fprintf(stderr, "Marked additional %s as out-of-sync based on AL.\n",
-		     ppsize(ppb, additional_bits_set * (cfg->md.bm_bytes_per_bit / 1024)));
+		     ppsize(ppb, (unsigned long long)additional_bits_set * (cfg->md.bm_bytes_per_bit / 1024)));
 	} else
 		fprintf(stderr, "Nothing to do.\n");
 }
@@ -2608,12 +2613,61 @@ int need_to_apply_al(struct format *cfg)
 	return 0;
 }
 
+/* Read the activity log and replay it into hot_extent[AL_EXTENTS_MAX]: the
+ * numbers of its active extents, -1U for unused entries.  Returns what the
+ * replay_al_*() functions return: negative for a log that cannot be
+ * interpreted, 0 for nothing to apply, positive otherwise.  Sets *re_initialize
+ * when the log has to be written in the current format. */
+static int read_al(struct format *cfg, uint32_t *hot_extent, int *re_initialize)
+{
+	struct al_transaction_on_disk *al_4k_disk = on_disk_buffer;
+	struct al_on_pmem *al_on_pmem = on_disk_buffer;
+	off_t al_size;
+	int err;
+
+	al_size = cfg->md.al_stripes * cfg->md.al_stripe_size_4k * 4096;
+
+	/* read in first chunk (which is actually the whole AL
+	 * for old fixed size 32k activity log */
+	pread_or_die(cfg, on_disk_buffer,
+		al_size < buffer_size ? al_size : buffer_size,
+		cfg->al_offset, "apply_al");
+
+	/* init all extent numbers to -1U aka "unused" */
+	memset(hot_extent, 0xff, AL_EXTENTS_MAX * sizeof(*hot_extent));
+
+	/* replay al */
+	if (is_v07(cfg))
+		err = replay_al_07(cfg, hot_extent);
+
+	/* FIXME
+	 * we should introduce a new meta data "super block" magic, so we won't
+	 * have the same super block with two different activity log
+	 * transaction layouts */
+	else if (DRBD_MD_MAGIC_84_UNCLEAN == cfg->md.magic ||
+		 DRBD_MD_MAGIC_09 == cfg->md.magic ||
+		 DRBD_AL_MAGIC == be32_to_cpu(al_4k_disk[0].magic.be) ||
+		 DRBD_AL_MAGIC == be32_to_cpu(al_4k_disk[1].magic.be) ||
+		 cfg->md.al_stripes != 1 || cfg->md.al_stripe_size_4k != 8) {
+		if (DRBD_AL_PMEM_MAGIC == be32_to_cpu(al_on_pmem->magic.be)) {
+			err = replay_al_pmem(cfg, hot_extent);
+		} else {
+			err = replay_al_84(cfg, hot_extent);
+		}
+	} else {
+		/* try the old al format anyways, this may be the first time we
+		* run after upgrading from < 8.4 to 8.4, and we need to
+		* transparently "convert" the activity log format. */
+		err = replay_al_07(cfg, hot_extent);
+		*re_initialize = 1;
+	}
+
+	return err;
+}
+
 int v08_move_internal_md_after_resize(struct format *cfg);
 int meta_apply_al(struct format *cfg, char **argv __attribute((unused)), int argc)
 {
-	off_t al_size;
-	struct al_transaction_on_disk *al_4k_disk = on_disk_buffer;
-	struct al_on_pmem *al_on_pmem = on_disk_buffer;
 	uint32_t hot_extent[AL_EXTENTS_MAX];
 	int need_to_update_md_flags = 0;
 	int re_initialize_anyways = 0;
@@ -2650,42 +2704,7 @@ int meta_apply_al(struct format *cfg, char **argv __attribute((unused)), int arg
 		goto initialize_al_and_update_md_flags;
 	}
 
-	al_size = cfg->md.al_stripes * cfg->md.al_stripe_size_4k * 4096;
-
-	/* read in first chunk (which is actually the whole AL
-	 * for old fixed size 32k activity log */
-	pread_or_die(cfg, on_disk_buffer,
-		al_size < buffer_size ? al_size : buffer_size,
-		cfg->al_offset, "apply_al");
-
-	/* init all extent numbers to -1U aka "unused" */
-	memset(hot_extent, 0xff, sizeof(hot_extent));
-
-	/* replay al */
-	if (is_v07(cfg))
-		err = replay_al_07(cfg, hot_extent);
-
-	/* FIXME
-	 * we should introduce a new meta data "super block" magic, so we won't
-	 * have the same super block with two different activity log
-	 * transaction layouts */
-	else if (DRBD_MD_MAGIC_84_UNCLEAN == cfg->md.magic ||
-		 DRBD_MD_MAGIC_09 == cfg->md.magic ||
-		 DRBD_AL_MAGIC == be32_to_cpu(al_4k_disk[0].magic.be) ||
-		 DRBD_AL_MAGIC == be32_to_cpu(al_4k_disk[1].magic.be) ||
-		 cfg->md.al_stripes != 1 || cfg->md.al_stripe_size_4k != 8) {
-		if (DRBD_AL_PMEM_MAGIC == be32_to_cpu(al_on_pmem->magic.be)) {
-			err = replay_al_pmem(cfg, hot_extent);
-		} else {
-			err = replay_al_84(cfg, hot_extent);
-		}
-	} else {
-		/* try the old al format anyways, this may be the first time we
-		* run after upgrading from < 8.4 to 8.4, and we need to
-		* transparently "convert" the activity log format. */
-		err = replay_al_07(cfg, hot_extent);
-		re_initialize_anyways = 1;
-	}
+	err = read_al(cfg, hot_extent, &re_initialize_anyways);
 
 	if (err < 0) {
 		/* ENODATA:
@@ -3589,6 +3608,7 @@ char *pretty_peer_md_flags(char *inbuf, unsigned int buf_size, unsigned int flag
 	/* MDF_PEER_FULL_SYNC   */ [3] = "full-sync",
 	/* MDF_PEER_DEVICE_SEEN */ [4] = "seen",
 	/* MDF_PEER_DIVERGENCE_BITMAP */ [5] = "divergence",
+	/* MDF_PEER_BITMAP_AUTHORITATIVE */ [6] = "authoritative",
 	/* MDF_NODE_EXISTS      */ [16] = "exists",
 	};
 
@@ -3794,6 +3814,13 @@ int meta_dump_md(struct format *cfg, char **argv __attribute((unused)), int argc
 /* cbt-dump finds no changed block tracking it can trust: back up everything */
 #define CBT_DUMP_NO_TRACKING 50
 
+/* The version of the JSON that cbt-dump prints */
+#define CBT_DUMP_FORMAT 1
+
+/* What a bit of the volume is to cbt-dump */
+#define CBT_STATE_DIRTY 1	/* set in the changed block tracking slot */
+#define CBT_STATE_ZERO 2	/* clear in the day0 bitmap: never written */
+
 struct cbt_extents {
 	uint64_t bm_bytes_per_bit;
 	uint64_t volume_size;
@@ -3801,9 +3828,11 @@ struct cbt_extents {
 	bool full;		/* --max-extents reached */
 };
 
-/* Print the extent of bits [start, end), unless --max-extents is reached;
- * then print where the next page starts instead. */
-static void cbt_put_extent(struct cbt_extents *x, uint64_t start, uint64_t end)
+/* Print the extent of bits [start, end) in "state", unless --max-extents is
+ * reached; then print where the next page starts instead.  The extents cover
+ * the volume without gaps, as the extents of ovirt-imageio do. */
+static void cbt_put_extent(struct cbt_extents *x, uint64_t start, uint64_t end,
+			   unsigned int state)
 {
 	uint64_t offset = start * x->bm_bytes_per_bit;
 	uint64_t last = end * x->bm_bytes_per_bit;
@@ -3821,25 +3850,144 @@ static void cbt_put_extent(struct cbt_extents *x, uint64_t start, uint64_t end)
 		x->full = true;
 		return;
 	}
-	printf("%s\n    { \"offset\": "U64", \"length\": "U64" }",
+	printf("%s\n    { \"start\": "U64", \"length\": "U64,
 	       x->emitted ? "," : "", offset, last - offset);
+	if (option_cbt_dump_mode == CBT_DUMP_MODE_DIRTY)
+		printf(", \"dirty\": %s, \"zero\": %s }",
+		       state & CBT_STATE_DIRTY ? "true" : "false",
+		       state & CBT_STATE_ZERO ? "true" : "false");
+	else
+		printf(", \"zero\": %s }", state & CBT_STATE_ZERO ? "true" : "false");
 	x->emitted++;
 }
 
-/* Print the changed block tracking slot of the meta data as extents of the
- * volume. Meant for the meta data in a snapshot that was taken while I/O was
- * suspended, after "drbdsetup cbt-flush".
+/* The bitmap slot that the changed block tracking holds, or -1 */
+static int cbt_bitmap_slot(const struct md_cpu *md)
+{
+	if (!(md->features & DRBD_MDFF_CBT) || !(md->cbt.flags & CBT_BOOKMARK_IN_USE))
+		return -1;
+	return md->cbt.bitmap_index;
+}
+
+/* The bitmap slots that hold the day0 bitmap: all that neither a peer nor the
+ * changed block tracking holds.  They have a bit set for every write since the
+ * meta data was created.  When a peer or the tracking frees a slot, the kernel
+ * (since drbd-9.0.15) and forget-peer copy one of them into it, or set all its
+ * bits when there is none.  So a slot that was freed when all were in use
+ * claims that all was written; ANDing all of them gives what was not. */
+static uint64_t day0_bitmap_slots(const struct md_cpu *md)
+{
+	uint64_t slots = (1ULL << md->max_peers) - 1;
+	int p, s;
+
+	for (p = 0; p < DRBD_NODE_ID_MAX; p++) {
+		s = md->peers[p].bitmap_index;
+		if (s >= 0 && s < DRBD_PEERS_MAX)
+			slots &= ~(1ULL << s);
+	}
+	s = cbt_bitmap_slot(md);
+	if (s >= 0 && s < DRBD_PEERS_MAX)
+		slots &= ~(1ULL << s);
+	return slots;
+}
+
+/* The bits of the latest writes may not be on disk yet: a write sets them in
+ * memory, and the kernel writes them out before their activity log extent
+ * leaves the log.  The AL extents the activity log names, sorted, without
+ * duplicates.  cbt_al_written() moves "pos" forward, so it must be called for
+ * the bitmap words in ascending order. */
+struct cbt_hot_al {
+	uint32_t *ext;
+	unsigned int n, pos;
+};
+
+/* Returns false when the activity log cannot tell. */
+static bool cbt_hot_al_extents(struct format *cfg, uint64_t n_extents,
+			       struct cbt_hot_al *hot)
+{
+	uint32_t *hot_extent;
+	int re_initialize = 0;
+	unsigned int n = 0;
+	int i, err;
+
+	if (cfg->md.flags & MDF_AL_DISABLED)
+		return false;
+	hot_extent = malloc(AL_EXTENTS_MAX * sizeof(*hot_extent));
+	if (!hot_extent) {
+		fprintf(stderr, "Out of memory\n");
+		exit(20);
+	}
+	err = read_al(cfg, hot_extent, &re_initialize);
+	if (err < 0) {
+		free(hot_extent);
+		return false;
+	}
+	for (i = 0; i < AL_EXTENTS_MAX; i++) {
+		if (hot_extent[i] < n_extents)
+			hot_extent[n++] = hot_extent[i];
+	}
+	qsort(hot_extent, n, sizeof(*hot_extent), cmp_u32);
+	hot->n = 0;
+	for (i = 0; i < (int)n; i++) {
+		if (!hot->n || hot_extent[i] != hot_extent[hot->n - 1])
+			hot_extent[hot->n++] = hot_extent[i];
+	}
+	hot->ext = hot_extent;
+	hot->pos = 0;
+	return true;
+}
+
+/* Is an AL extent in "hot" between first and last, both included? */
+static bool cbt_al_hit(struct cbt_hot_al *hot, uint64_t first, uint64_t last)
+{
+	while (hot->pos < hot->n && hot->ext[hot->pos] < first)
+		hot->pos++;
+	return hot->pos < hot->n && hot->ext[hot->pos] <= last;
+}
+
+/* The bits of word k that lie in an AL extent of "hot" */
+static uint32_t cbt_al_written(struct cbt_hot_al *hot,
+			       uint64_t bm_bytes_per_bit, uint64_t k)
+{
+	uint64_t bit = k * 32;
+	uint64_t first = (bit * bm_bytes_per_bit) >> AL_EXTENT_SHIFT;
+	uint64_t last = ((bit + 32) * bm_bytes_per_bit - 1) >> AL_EXTENT_SHIFT;
+	uint32_t written = 0;
+	unsigned int b;
+
+	if (!cbt_al_hit(hot, first, last))
+		return 0;
+	if (first == last)
+		return ~0U;
+	for (b = 0; b < 32; b++, bit++) {
+		first = (bit * bm_bytes_per_bit) >> AL_EXTENT_SHIFT;
+		last = ((bit + 1) * bm_bytes_per_bit - 1) >> AL_EXTENT_SHIFT;
+		if (cbt_al_hit(hot, first, last))
+			written |= 1U << b;
+	}
+	return written;
+}
+
+/* Print the volume as JSON extents.  --mode=dirty: each extent is "dirty" if
+ * the changed block tracking slot of the meta data has it set, and "zero" if
+ * the day0 bitmap has it clear.  Meant for the meta data in a snapshot that was
+ * taken while I/O was suspended, after "drbdsetup cbt-flush".  --mode=zero:
+ * only the "zero" flag, which needs no changed block tracking.
  */
 int meta_cbt_dump(struct format *cfg, char **argv __attribute((unused)), int argc)
 {
 	const struct cbt_md_cpu *cbt = &cfg->md.cbt;
+	const bool dirty_mode = option_cbt_dump_mode == CBT_DUMP_MODE_DIRTY;
 	le_u32 const *bm = on_disk_buffer;
 	struct cbt_extents x = { };
-	unsigned int max_peers;
-	uint64_t bits, words, k, run_start = 0;
+	unsigned int max_peers, n_day0 = 0, state = 0, nb, b, s;
+	unsigned int day0[DRBD_PEERS_MAX];
+	uint64_t bits, words, k, run_start = 0, n_al_extents = 0;
+	uint64_t day0_slots;
+	struct cbt_hot_al hot = { };
+	struct cbt_thin *thin = NULL;
 	off_t bm_off;
 	size_t max_chunk, n_buffer = 0, i = 0;
-	bool in_run = false;
 	char since[sizeof("YYYY-MM-DDTHH:MM:SSZ")];
 	time_t since_t;
 	struct tm tm;
@@ -3852,56 +4000,101 @@ int meta_cbt_dump(struct format *cfg, char **argv __attribute((unused)), int arg
 		return -1;
 	}
 	if (!is_v09(cfg)) {
-		fprintf(stderr, "Changed block tracking needs v09 meta data\n");
-		exit(CBT_DUMP_NO_TRACKING);
-	}
-	if (!(cfg->md.features & DRBD_MDFF_CBT) || !(cbt->flags & CBT_BOOKMARK_IN_USE)) {
-		fprintf(stderr, "No changed block tracking in this meta data\n");
-		exit(CBT_DUMP_NO_TRACKING);
-	}
-	if (cbt->flags & CBT_BOOKMARK_INVALID) {
-		fprintf(stderr, "The changed block tracking is invalid\n");
-		exit(CBT_DUMP_NO_TRACKING);
-	}
-	if (!(cfg->md.flags & MDF_AL_CLEAN) && !(cbt->flags & CBT_BOOKMARK_FLUSHED)) {
-		fprintf(stderr, "The bitmap was not flushed: take the snapshot while I/O is\n"
-			"suspended, after \"drbdsetup cbt-flush\"\n");
+		fprintf(stderr, "%s needs v09 meta data\n",
+			dirty_mode ? "Changed block tracking" : "The day0 bitmap");
 		exit(CBT_DUMP_NO_TRACKING);
 	}
 	max_peers = cfg->md.max_peers;
-	if (cbt->bitmap_index < 0 || cbt->bitmap_index >= max_peers) {
-		fprintf(stderr, "Bitmap index %d of the changed block tracking exceeds "
-			"%u bitmap slots\n", cbt->bitmap_index, max_peers);
-		exit(CBT_DUMP_NO_TRACKING);
-	}
-
 	x.bm_bytes_per_bit = cfg->md.bm_bytes_per_bit;
 	x.volume_size = cfg->md.effective_size * 512;
 	bits = (x.volume_size + x.bm_bytes_per_bit - 1) / x.bm_bytes_per_bit;
 	words = (bits + 31) / 32;
 
-	since_t = cbt->since;
-	gmtime_r(&since_t, &tm);
-	if (strftime(since, sizeof(since), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
-		since[0] = '\0';
-	printf("{\n"
-	       "  \"id\": \""X64(016)"\",\n"
-	       "  \"since\": \"%s\",\n"
-	       "  \"volume-size\": "U64",\n"
-	       "  \"extents\": [",
-	       cbt->id, since, x.volume_size);
+	if (dirty_mode) {
+		if (!(cfg->md.features & DRBD_MDFF_CBT) || !(cbt->flags & CBT_BOOKMARK_IN_USE)) {
+			fprintf(stderr, "No changed block tracking in this meta data\n");
+			exit(CBT_DUMP_NO_TRACKING);
+		}
+		if (cbt->flags & CBT_BOOKMARK_INVALID) {
+			fprintf(stderr, "The changed block tracking is invalid\n");
+			exit(CBT_DUMP_NO_TRACKING);
+		}
+		if (!(cfg->md.flags & MDF_AL_CLEAN) && !(cbt->flags & CBT_BOOKMARK_FLUSHED)) {
+			fprintf(stderr, "The bitmap was not flushed: take the snapshot while I/O is\n"
+				"suspended, after \"drbdsetup cbt-flush\"\n");
+			exit(CBT_DUMP_NO_TRACKING);
+		}
+		if (cbt->bitmap_index < 0 || (unsigned int)cbt->bitmap_index >= max_peers) {
+			fprintf(stderr, "Bitmap index %d of the changed block tracking exceeds "
+				"%u bitmap slots\n", cbt->bitmap_index, max_peers);
+			exit(CBT_DUMP_NO_TRACKING);
+		}
+	}
 
-	/* The slots interleave word by word: word k of our slot is the 32 bit
-	 * word k * max_peers + bitmap_index of the bitmap area. Read the area
-	 * in chunks of whole rows of all slots. */
+	/* The thin mappings must belong to the data of the volume.  With
+	 * internal meta data, that is the meta data device; with external
+	 * meta data, only --data-device names it. */
+	if (option_data_device && access(option_data_device, F_OK)) {
+		fprintf(stderr, "--data-device %s: %m\n", option_data_device);
+		exit(20);
+	}
+	if (option_thin_dump)
+		thin = cbt_thin_open_file(option_thin_dump);
+	else if (option_data_device)
+		thin = cbt_thin_open_device(option_data_device);
+	else if (cfg->md_index == DRBD_MD_INDEX_FLEX_INT)
+		thin = cbt_thin_open_device(cfg->md_device_name);
+
+	if (thin) {
+		/* The thin pool knows what is zero, the bitmap is not needed */
+	} else if (!dirty_mode && !(cfg->md.flags & MDF_AL_CLEAN) &&
+		   !(cbt_bitmap_slot(&cfg->md) >= 0 && (cbt->flags & CBT_BOOKMARK_FLUSHED))) {
+		/* Without a flush, count what the activity log names as written. */
+		n_al_extents = (x.volume_size + (1ULL << AL_EXTENT_SHIFT) - 1) >> AL_EXTENT_SHIFT;
+		if (!cbt_hot_al_extents(cfg, n_al_extents, &hot)) {
+			fprintf(stderr, "The bitmap was not flushed, and the activity log cannot\n"
+				"tell what is missing from it\n");
+			exit(CBT_DUMP_NO_TRACKING);
+		}
+	}
+
+	day0_slots = day0_bitmap_slots(&cfg->md);
+	for (s = 0; s < max_peers; s++) {
+		if (day0_slots & (1ULL << s))
+			day0[n_day0++] = s;
+	}
+	if (thin)
+		n_day0 = 0;
+	else if (!n_day0)
+		fprintf(stderr, "No bitmap slot holds the day0 bitmap: "
+			"no extent is known to be zero\n");
+
+	printf("{\n"
+	       "  \"format\": %d,\n", CBT_DUMP_FORMAT);
+	if (dirty_mode) {
+		since_t = cbt->since;
+		gmtime_r(&since_t, &tm);
+		if (strftime(since, sizeof(since), "%Y-%m-%dT%H:%M:%SZ", &tm) == 0)
+			since[0] = '\0';
+		printf("  \"id\": \""X64(016)"\",\n"
+		       "  \"since\": \"%s\",\n",
+		       cbt->id, since);
+	}
+	printf("  \"volume-size\": "U64",\n"
+	       "  \"extents\": [",
+	       x.volume_size);
+
+	/* The slots interleave word by word: word k of slot s is the 32 bit
+	 * word k * max_peers + s of the bitmap area. Read the area in chunks
+	 * of whole rows of all slots. */
 	max_chunk = round_down(buffer_size, 4096 * max_peers);
 	bm_off = cfg->bm_offset;
 	k = option_start_offset / x.bm_bytes_per_bit / 32;
 	bm_off += round_down(k * max_peers * sizeof(*bm), 4096 * max_peers);
 	k = (bm_off - cfg->bm_offset) / sizeof(*bm) / max_peers;
+	run_start = k * 32;
 	for (; k < words && !x.full; k++, i += max_peers) {
-		uint32_t w;
-		unsigned int b;
+		uint32_t dirty = 0, written = 0, zero;
 
 		if (i >= n_buffer) {
 			size_t chunk = max_chunk;
@@ -3912,28 +4105,42 @@ int meta_cbt_dump(struct format *cfg, char **argv __attribute((unused)), int arg
 			pread_or_die(cfg, on_disk_buffer, chunk, bm_off, "cbt_dump");
 			bm_off += chunk;
 			n_buffer = chunk / sizeof(*bm);
-			i = cbt->bitmap_index;
+			i = 0;
 		}
-		w = le32_to_cpu(bm[i].le);
-		if (w == (in_run ? ~0U : 0U))
-			continue;
-		for (b = 0; b < 32; b++) {
-			bool set = w & (1U << b);
+		if (dirty_mode)
+			dirty = le32_to_cpu(bm[i + cbt->bitmap_index].le);
+		if (n_day0) {
+			written = ~0U;
+			for (s = 0; s < n_day0 && written; s++)
+				written &= le32_to_cpu(bm[i + day0[s]].le);
+			written |= cbt_al_written(&hot, x.bm_bytes_per_bit, k);
+		}
+		if (thin)
+			zero = cbt_thin_zero(thin, x.bm_bytes_per_bit, k);
+		else
+			zero = n_day0 ? ~written : 0;
 
-			if (set && !in_run) {
-				run_start = k * 32 + b;
-				in_run = true;
-			} else if (!set && in_run) {
-				cbt_put_extent(&x, run_start, k * 32 + b);
-				in_run = false;
-			}
+		if (dirty == (state & CBT_STATE_DIRTY ? ~0U : 0U) &&
+		    zero == (state & CBT_STATE_ZERO ? ~0U : 0U))
+			continue;
+		nb = bits - k * 32 < 32 ? bits - k * 32 : 32;
+		for (b = 0; b < nb; b++) {
+			unsigned int st = (dirty >> b & 1 ? CBT_STATE_DIRTY : 0) |
+					  (zero >> b & 1 ? CBT_STATE_ZERO : 0);
+
+			if (st == state)
+				continue;
+			cbt_put_extent(&x, run_start, k * 32 + b, state);
+			run_start = k * 32 + b;
+			state = st;
 		}
 	}
-	if (in_run)
-		cbt_put_extent(&x, run_start, bits);
+	cbt_put_extent(&x, run_start, bits, state);
 	if (!x.full)
 		printf("%s]\n", x.emitted ? "\n  " : " ");
 	printf("}\n");
+	free(hot.ext);
+	cbt_thin_close(thin);
 
 	return cfg->ops->close(cfg);
 }
@@ -7003,11 +7210,36 @@ static int day0_peer_id(struct format *cfg)
 	return -1;
 }
 
+/* Copy bitmap slot "from" of the on-disk bitmap to slot "to", or set all bits
+ * of "to" when "from" is negative. */
+static void copy_bitmap_slot_pwrite(struct format *cfg, int from, int to)
+{
+	const unsigned int max_peers = cfg->md.max_peers;
+	const size_t max_chunk = round_down(buffer_size, 4096 * max_peers);
+	const size_t bitmap_bytes = ALIGN(cfg->bm_bytes, cfg->md_hard_sect_size);
+	le_u32 *bm = on_disk_buffer;
+	off_t bm_off = cfg->bm_offset;
+	size_t bytes_left = bitmap_bytes;
+	size_t chunk, i;
+
+	/* The slots interleave word by word, see meta_cbt_dump(). */
+	while (bytes_left) {
+		chunk = max_chunk < bytes_left ? max_chunk : bytes_left;
+		pread_or_die(cfg, on_disk_buffer, chunk, bm_off, "copy_bitmap_slot");
+		for (i = 0; i + max_peers <= chunk / sizeof(*bm); i += max_peers)
+			bm[i + to].le = from < 0 ? ~0U : bm[i + from].le;
+		pwrite_or_die(cfg, on_disk_buffer, chunk, bm_off, "copy_bitmap_slot");
+		bm_off += chunk;
+		bytes_left -= chunk;
+	}
+}
+
 int meta_forget_peer(struct format *cfg, char **argv, int argc)
 {
+	uint64_t day0_slots;
 	int day0_p;
 	int err;
-	int to_index;
+	int to_index, from_index = -1, s;
 
 	err = cfg->ops->open(cfg);
 	if (err)
@@ -7015,21 +7247,36 @@ int meta_forget_peer(struct format *cfg, char **argv, int argc)
 
 	day0_p = day0_peer_id(cfg);
 
+	/* Like clear_peer_slot() in the kernel: the freed bitmap slot becomes
+	 * a day0 slot, so it has to track all writes since day0.  Copy a slot
+	 * that does, found while the freed one is still taken, or set all bits
+	 * when there is none. */
 	to_index = cfg->md.peers[option_node_id].bitmap_index;
+	if (is_v09(cfg) && to_index >= 0 && (unsigned int)to_index < cfg->md.max_peers) {
+		day0_slots = day0_bitmap_slots(&cfg->md);
+		for (s = 0; s < (int)cfg->md.max_peers; s++) {
+			if (day0_slots & (1ULL << s)) {
+				from_index = s;
+				break;
+			}
+		}
+		if (from_index >= 0)
+			fprintf(stderr, "Copying day0 bitmap slot %d to the freed slot %d\n",
+				from_index, to_index);
+		else
+			fprintf(stderr, "No day0 bitmap slot to copy: setting all bits "
+				"of the freed slot %d\n", to_index);
+		copy_bitmap_slot_pwrite(cfg, from_index, to_index);
+	}
+
 	cfg->md.peers[option_node_id].bitmap_index = -1;
 	cfg->md.peers[option_node_id].flags = 0;
 	if (day0_p > -1) {
-		int from_index;
 		cfg->md.peers[option_node_id].bitmap_uuid = cfg->md.peers[day0_p].bitmap_uuid;
 		cfg->md.peers[option_node_id].bitmap_dagtag = cfg->md.peers[day0_p].bitmap_dagtag;
-		from_index = cfg->md.peers[day0_p].bitmap_index;
-		fprintf(stderr, "Copying bitmap slot %d to %d not implemented.\n"
-			"Do it with dump-md, edit, restore-md\n", from_index, to_index);
 	} else {
 		cfg->md.peers[option_node_id].bitmap_uuid = 0;
 		cfg->md.peers[option_node_id].bitmap_dagtag = 0;
-		fprintf(stderr, "Setting all bits in slot %d not implemented.\n"
-			"Do it with dump-md, edit, restore-md\n", to_index);
 	}
 
 	cfg->ops->md_cpu_to_disk(cfg);
@@ -7363,6 +7610,22 @@ int main(int argc, char **argv)
 		break;
 	    case OPT_MAX_EXTENTS:
 		option_max_extents = m_strtoll(optarg, 1);
+		break;
+	    case OPT_MODE:
+		if (!strcmp(optarg, "dirty"))
+			option_cbt_dump_mode = CBT_DUMP_MODE_DIRTY;
+		else if (!strcmp(optarg, "zero"))
+			option_cbt_dump_mode = CBT_DUMP_MODE_ZERO;
+		else {
+			fprintf(stderr, "--mode: dirty or zero, not \"%s\"\n", optarg);
+			exit(20);
+		}
+		break;
+	    case OPT_THIN_DUMP:
+		option_thin_dump = optarg;
+		break;
+	    case OPT_DATA_DEVICE:
+		option_data_device = optarg;
 		break;
 	    default:
 		print_usage_and_exit();
