@@ -192,7 +192,7 @@ struct format_ops {
 		##__VA_ARGS__);					\
 	abort(); }						\
 	} while (0)
-#define ASSERT(x) ASSERT_MSG((x), "");
+#define ASSERT(x) ASSERT_MSG((x), "")
 #define d_expect(x) ({						\
 	int _x = (x);						\
 	if (!_x)						\
@@ -219,6 +219,14 @@ int is_apply_al_cmd(void);
 bool confirmed(const char *text);
 unsigned long bm_bytes(const struct md_cpu * const md, uint64_t sectors);
 enum md_format format_version(const struct format *cfg);
+
+	/* The zero extents of cbt-dump on a dm-thin volume, drbdmeta_thin.c.
+	 * WinDRBD has stubs, the open functions never return a cbt_thin. */
+struct cbt_thin;
+struct cbt_thin *cbt_thin_open_device(const char *dev);
+struct cbt_thin *cbt_thin_open_file(const char *path);
+uint32_t cbt_thin_zero(struct cbt_thin *thin, uint64_t bm_bytes_per_bit, uint64_t k);
+void cbt_thin_close(struct cbt_thin *thin);
 
 extern int opened_odirect;
 extern int verbose;
