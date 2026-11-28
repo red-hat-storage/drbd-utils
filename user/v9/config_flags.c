@@ -1163,6 +1163,27 @@ struct context_def attach_cmd_ctx = {
 		{ } },
 };
 
+/* drbdadm's attach: the disk options plus those of attach_parms_ctx */
+struct context_def attach_adm_ctx = {
+	NLA_POLICY(disk_conf),
+	.attr_set = NL_SET_DISK_CONF,
+	.fields = {
+		{ "size", NUMERIC(DRBD_A_DISK_CONF_DISK_SIZE, disk_size, DISK_SIZE),
+		  .unit = "bytes" },
+		CHANGEABLE_DISK_OPTIONS,
+		{ .name = "discard-my-data", .argument_is_optional = true },
+		{ } },
+};
+
+struct context_def attach_parms_ctx = {
+	NLA_POLICY(attach_parms),
+	.attr_set = NL_SET_ATTACH_PARMS,
+	.fields = {
+		{ "discard-my-data", FLAG(DRBD_A_ATTACH_PARMS_ATTACH_DISCARD_MY_DATA) },
+		{ }
+	},
+};
+
 struct context_def detach_cmd_ctx = {
 	NLA_POLICY(detach_parms),
 	.attr_set = NL_SET_DETACH_PARMS,
@@ -1349,6 +1370,7 @@ struct context_def create_md_ctx = {
 		{ .name = "force", .argument_is_optional = true },
 		{ .name = "effective-size", .argument_is_optional = false },
 		{ .name = "bitmap-block-size", .argument_is_optional = false },
+		{ .name = "initialize-bitmap", .argument_is_optional = false },
 		{ .name = "diskful-peers", .argument_is_optional = false },
 		{ .name = "peers", .argument_is_optional = false },
 		{ .name = "bitmap-slots", .argument_is_optional = false },
@@ -1371,6 +1393,8 @@ struct context_def cbt_dump_adm_ctx = {
 		{ .name = "md-snapshot", .argument_is_optional = false },
 		{ .name = "start-offset", .argument_is_optional = false },
 		{ .name = "max-extents", .argument_is_optional = false },
+		{ .name = "mode", .argument_is_optional = false },
+		{ .name = "data-snapshot", .argument_is_optional = false },
 		{ } },
 };
 

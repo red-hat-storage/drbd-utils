@@ -306,6 +306,14 @@ static struct option connect_84_options[] = {
 };
 #endif
 
+static const char attach_discard_my_data_unsupported[] =
+	"attach --discard-my-data: not supported by this DRBD kernel module";
+
+static struct option attach_extra_options[] = {
+	{ "discard-my-data", optional_argument, NULL, OPT_ATTACH_DISCARD_MY_DATA },
+	{ }
+};
+
 const struct drbd_cmd attach_cmd = {
 	"attach", CTX_MINOR, DRBD_NL_CMD_ATTACH, NL_SET_DISK_CONF, F_CONFIG_CMD,
 	.drbd_args = (struct drbd_argument[]) {
@@ -313,6 +321,7 @@ const struct drbd_cmd attach_cmd = {
 		{ "meta_data_dev", DRBD_A_DISK_CONF_META_DEV, conv_block_dev },
 		{ "meta_data_index", DRBD_A_DISK_CONF_META_DEV_IDX, conv_md_idx },
 		{ } },
+	.options = attach_extra_options,
 	.ctx = &attach_cmd_ctx,
 	.summary = "Attach a lower-level device to an existing replicated device.",
 #ifdef DRBD_LEGACY_84
@@ -1185,6 +1194,10 @@ static int _generic_config_cmd(const struct drbd_cmd *cm, int argc, char **argv)
 	int rv;
 	const char *desc = NULL; /* error description from kernel reply message */
 	bool set_defaults = false;
+	bool attach_discard_my_data = false;
+	const char *attach_discard_my_data_arg = NULL;
+	long attach_parms_offs = -1;
+	__u32 bad_attr_offs;
 	struct drbd_nl_outcome outcome = { .ret_code = NO_ERROR, .timeout_type = -1 };
 	struct msg_buff *smsg;
 	struct iovec iov;
@@ -1241,6 +1254,10 @@ static int _generic_config_cmd(const struct drbd_cmd *cm, int argc, char **argv)
 			}
 		} else if (c == '(')
 			set_defaults = true;
+		else if (c == OPT_ATTACH_DISCARD_MY_DATA) {
+			attach_discard_my_data = true;
+			attach_discard_my_data_arg = optarg;
+		}
 		else {
 			rv = OTHER_ERROR;
 			goto error;
@@ -1284,6 +1301,27 @@ static int _generic_config_cmd(const struct drbd_cmd *cm, int argc, char **argv)
 
 	if (nla)
 		nla_nest_end(smsg, nla);
+	if (attach_discard_my_data) {
+		struct field_def *field = &attach_parms_ctx.fields[0];
+
+		nla = nl->nest_start(smsg, NL_SET_ATTACH_PARMS);
+		/* Without strict netlink validation, an older module would
+		 * ignore the attribute instead of rejecting it. */
+		if (nl->family->maxattr && nla_type(nla) > nl->family->maxattr) {
+			desc = attach_discard_my_data_unsupported;
+			rv = OTHER_ERROR;
+			goto error;
+		}
+		attach_parms_offs = (unsigned char *)nla - smsg->data;
+		if (!field->ops->put(&attach_parms_ctx, field, smsg,
+				     attach_discard_my_data_arg)) {
+			fprintf(stderr, "Option --%s: invalid argument '%s'\n",
+				field->name, attach_discard_my_data_arg);
+			rv = OTHER_ERROR;
+			goto error;
+		}
+		nla_nest_end(smsg, nla);
+	}
 	if (set_defaults)
 		nl->put_set_defaults(smsg);
 	/* The identity comes last: drbd2 carries the path addresses and the
@@ -1369,6 +1407,11 @@ static int _generic_config_cmd(const struct drbd_cmd *cm, int argc, char **argv)
 	}
 	if (cm->missing_ok && outcome_is_missing(&outcome, ERR_RES_NOT_KNOWN))
 		rv = NO_ERROR;
+	if (rv != NO_ERROR && attach_parms_offs >= 0 &&
+	    nlmsg_extack_offs(nlh, &bad_attr_offs) && bad_attr_offs == attach_parms_offs) {
+		desc = attach_discard_my_data_unsupported;
+		rv = OTHER_ERROR;
+	}
 
 error:
 	msg_free(smsg);
