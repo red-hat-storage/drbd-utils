@@ -392,7 +392,7 @@ int adm_adjust_wp(const struct cfg_ctx *ctx)
 	.verify_ips = 0,		\
 	.no_kernel = 1,			\
 
-/*  */ struct adm_cmd attach_cmd = {"attach", adm_attach, &attach_cmd_ctx, CFG_DISK, ACF1_MINOR_ONLY };
+/*  */ struct adm_cmd attach_cmd = {"attach", adm_attach, &attach_adm_ctx, CFG_DISK, ACF1_MINOR_ONLY };
 /*  */ struct adm_cmd disk_options_cmd = {"disk-options", adm_attach, &attach_cmd_ctx, CFG_DISK, ACF1_MINOR_ONLY };
 /*  */ struct adm_cmd detach_cmd = {"detach", adm_drbdsetup, &detach_cmd_ctx, CFG_DISK_PREP_DOWN, .takes_long = 1, ACF1_MINOR_ONLY };
 /*  */ struct adm_cmd new_peer_cmd = {"new-peer", adm_new_peer, &new_peer_cmd_ctx, CFG_NET_PREP_UP, ACF1_CONNECT};
@@ -1727,6 +1727,7 @@ static int adm_cbt_start(const struct cfg_ctx *ctx)
 static int adm_cbt_dump(const struct cfg_ctx *ctx)
 {
 	const char *md_snapshot = backend_option_value("--md-snapshot=");
+	const char *data_snapshot = backend_option_value("--data-snapshot=");
 	struct d_volume *vol = ctx->vol;
 	const char *argv[MAX_ARGS];
 	struct d_name *opt;
@@ -1751,6 +1752,15 @@ static int adm_cbt_dump(const struct cfg_ctx *ctx)
 	opt = find_backend_option("--max-extents=");
 	if (opt)
 		argv[NA(argc)] = opt->name;
+	opt = find_backend_option("--mode=");
+	if (opt)
+		argv[NA(argc)] = opt->name;
+	/* Not the disk of the configuration: its thin mappings change after
+	 * the snapshot, a discard would turn data of the snapshot into zeros. */
+	if (data_snapshot) {
+		argv[NA(argc)] = "--data-device";
+		argv[NA(argc)] = data_snapshot;
+	}
 	argv[NA(argc)] = 0;
 
 	return m_system_ex(argv, SLEEPS_LONG, ctx->res->name);

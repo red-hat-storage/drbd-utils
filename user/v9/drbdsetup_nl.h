@@ -100,10 +100,11 @@ enum drbd_nl_attr_set {
 	NL_SET_RENAME_RESOURCE_PARMS,
 	NL_SET_SUSPEND_IO_PARMS,
 	NL_SET_CBT_START_PARMS,
+	NL_SET_ATTACH_PARMS,
 	__NL_SET_MAX,
 };
 
-/* Fields of sets only the drbd2 family carries */
+/* Field ids of cbt-start-parms; the same in both families */
 #define NL_F_CBT_START_PARMS_BOOKMARK_ID	1
 
 /* The changed block tracking state of a device (cbt-status). */
